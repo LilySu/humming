@@ -74,7 +74,9 @@ public:
   // for grouped gemm
   uint32_t current_shape_m;
   uint32_t expert_max_num_tokens;
-  uint32_t offset_in_expert = 0;
+  uint32_t m_block_in_expert = 0;
+  uint32_t current_expert_num_tokens = 0;
+  uint32_t current_expert_m_blocks = 0;
   uint32_t m_offset = 0;
 
   CUDA_INLINE
@@ -88,6 +90,10 @@ public:
     current_shape_m = ctx.params.shape_m;
     expert_max_num_tokens = ctx.params.shape_m / Ctx::kNumExperts;
     calc_m_blocks();
+    if constexpr (kIsGroupedGemm) {
+      current_expert_num_tokens = ctx.smem.expert_tokens[0];
+      current_expert_m_blocks = CEIL_DIV(current_expert_num_tokens, BlockShape::M);
+    }
     mn_blocks = m_blocks * N_BLOCKS;
     mnk_blocks = mn_blocks * K_BLOCKS;
     uint32_t kNumCtaGroups = gridDim.x / kMultiCastSize;
@@ -155,30 +161,25 @@ public:
       if constexpr (kUseCpAsync) cp_async_wait_group<0>();
       __syncthreads();
 
-      if constexpr (kIsGroupedContiguousGemm) {
-        ctx.smem.expert_tokens[kNumExperts - 1] = ctx.params.shape_m - ctx.smem.expert_offset[kNumExperts - 1];
-        PRAGMA_UNROLL
-        for (uint32_t i = 0; i < CEIL_DIV(kNumExperts - 1, kNumThreads); i++) {
-          uint32_t index = kNumThreads * i + threadIdx.x;
-          if (index < kNumExperts - 1) {
-            ctx.smem.expert_tokens[index] = ctx.smem.expert_offset[index + 1] - ctx.smem.expert_offset[index];
-          }
-        }
-
-        __syncthreads();
-      }
-
       if (ctx.warp_id() == 0) {
         uint32_t tmp_m_blocks = 0;
         PRAGMA_UNROLL
         for (uint32_t i = 0; i < CEIL_DIV(kNumExperts, 32); i++) {
           uint32_t index = 32 * i + threadIdx.x;
           if (index < kNumExperts) {
-            tmp_m_blocks += CEIL_DIV(ctx.smem.expert_tokens[index], BlockShape::M);
+            uint32_t expert_tokens;
+            if constexpr (kIsGroupedContiguousGemm) {
+              uint32_t next_offset =
+                  index + 1 < kNumExperts ? ctx.smem.expert_offset[index + 1] : ctx.params.shape_m;
+              expert_tokens = next_offset - ctx.smem.expert_offset[index];
+              ctx.smem.expert_tokens[index] = expert_tokens;
+            } else {
+              expert_tokens = ctx.smem.expert_tokens[index];
+            }
+            tmp_m_blocks += CEIL_DIV(expert_tokens, BlockShape::M);
           }
         }
 
-        __syncwarp();
         m_blocks = warp_reduce_add(tmp_m_blocks);
         if (threadIdx.x == 0) ctx.smem.total_m_blocks[0] = m_blocks;
       }
@@ -279,20 +280,23 @@ public:
   CUDA_INLINE
   void fetch_moe_group_block() {
     uint32_t delta_m_block_id = m_block_id - old_m_block_id;
-    offset_in_expert += delta_m_block_id * BlockShape::M;
+    m_block_in_expert += delta_m_block_id;
 
-    while (offset_in_expert >= ctx.smem.expert_tokens[expert_id]) {
-      offset_in_expert -= CEIL_DIV(ctx.smem.expert_tokens[expert_id], BlockShape::M) * BlockShape::M;
+    while (m_block_in_expert >= current_expert_m_blocks) {
+      m_block_in_expert -= current_expert_m_blocks;
       expert_id++;
+      current_expert_num_tokens = ctx.smem.expert_tokens[expert_id];
+      current_expert_m_blocks = CEIL_DIV(current_expert_num_tokens, BlockShape::M);
     }
 
     old_m_block_id = m_block_id;
+    uint32_t offset_in_expert = m_block_in_expert * BlockShape::M;
     if constexpr (Ctx::kIsGroupedMaskedGemm) {
       m_offset = expert_id * expert_max_num_tokens + offset_in_expert;
-      current_shape_m = expert_id * expert_max_num_tokens + ctx.smem.expert_tokens[expert_id];
+      current_shape_m = expert_id * expert_max_num_tokens + current_expert_num_tokens;
     } else if constexpr (Ctx::kIsGroupedContiguousGemm) {
       m_offset = ctx.smem.expert_offset[expert_id] + offset_in_expert;
-      current_shape_m = ctx.smem.expert_offset[expert_id] + ctx.smem.expert_tokens[expert_id];
+      current_shape_m = ctx.smem.expert_offset[expert_id] + current_expert_num_tokens;
     }
 
     if (old_expert_id != expert_id) update_tensor_map_c();

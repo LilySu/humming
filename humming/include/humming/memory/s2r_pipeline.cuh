@@ -62,6 +62,11 @@ public:
         loader_bs(ctx), loader_bzp(ctx), loader_bias(ctx) {
   }
 
+  CUDA_INLINE void seek(uint32_t m_offset) {
+    if constexpr (kHasInputScale) loader_as.seek(m_offset);
+    if constexpr (kHasInputScale2) loader_as2.seek(m_offset);
+  }
+
   template <bool kIsFirst = false>
   CUDA_INLINE void load_stage_iter(uint32_t stage_id, uint32_t iter_id) {
     stage_id = (stage_id + iter_id / Ctx::kWarpIters) % kNumStages;

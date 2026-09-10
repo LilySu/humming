@@ -9,6 +9,7 @@ import random
 from humming.config import ComputeConfig, GemmType, LayerConfig, MmaType, TuningConfig
 from humming.device import current_device
 from humming.tune import get_heuristics_config
+from humming.utils.math import round_up
 from humming.utils.smem import fits_device_smem
 
 NUM_SAMPLED_TUNING_CONFIGS = 100
@@ -197,17 +198,16 @@ def _generate_transfer_candidates(
             continue
         if (use_tma or signature["use_warp_spec"]) and not signature["use_mbarrier"]:
             continue
-        if compute_config.gemm_type.value == "indexed":
-            tma_values.update(use_tma_a=False, use_tma_as=False, use_tma_c=False)
-            tma_values["use_tma_as2"] = False
+        if compute_config.gemm_type == GemmType.INDEXED:
+            tma_values.update(use_tma_a=False, use_tma_as=False, use_tma_as2=False, use_tma_c=False)
         if not (
             layer_config.has_input_scale
             and layer_config.input_scale_group_size > 0
             and compute_config.use_m_major_input_scale
         ):
-            tma_values["use_tma_as"] = False
+            tma_values.update(use_tma_as=False)
         if not layer_config.has_input_scale_2 or layer_config.is_tensor_input_scale_2:
-            tma_values["use_tma_as2"] = False
+            tma_values.update(use_tma_as2=False)
         if not _is_legal_multicast_transfer(compute_config, sm_version, signature, tma_values):
             continue
         config = base | signature | tma_values | {"use_tma": use_tma}
@@ -291,7 +291,7 @@ def _fits_device_resources(
 
     if layer_config.mma_type == MmaType.WGMMA:
         register_overhead = 38
-        math_thread_registers = math.ceil((warp_shape[0] / 2 + register_overhead) / 8) * 8
+        math_thread_registers = round_up(warp_shape[0] // 2 + register_overhead, 8)
         launch_bound_registers = registers_per_sm // (num_threads * num_ctas_per_sm) // 8 * 8
         if math_thread_registers > launch_bound_registers:
             return False

@@ -98,7 +98,7 @@ public:
     gmem_writer.seek(m_block_id, n_block_id, current_shape_m, m_offset);
     if constexpr (kHasTensorInputScale) {
       const uint32_t *as_ptr = reinterpret_cast<const uint32_t *>(Ctx::kIsTensorInputScale2 ? ctx.params.as2 : ctx.params.as);
-      arith.as[0] = as_ptr[Ctx::kIsDenseGemm ? 0 : expert_id];
+      arith.as[0] = as_ptr[0];
     }
     if constexpr (Ctx::kHasTensorWeightScale) {
       const uint32_t *gs_ptr = reinterpret_cast<const uint32_t *>(Ctx::kIsTensorWeightScale2 ? ctx.params.bs2 : ctx.params.bs);

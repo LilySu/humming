@@ -1,9 +1,9 @@
 """Hardware-derived launch planning for process-input kernels."""
 
 import dataclasses
-import math
 
 from humming.config import InputQuantizationMode
+from humming.utils.math import ceil_div, positive_divisors, powers_of_two_up_to
 
 from .enums import ActivationType
 
@@ -22,28 +22,6 @@ class ProcessInputPlan:
     @property
     def threads(self) -> int:
         return self.threads_per_task * self.tokens_per_block
-
-
-def _ceil_div(value: int, divisor: int) -> int:
-    return (value + divisor - 1) // divisor
-
-
-def _powers(limit: int):
-    value = 1
-    while value <= limit:
-        yield value
-        value *= 2
-
-
-def _divisors(value: int):
-    result = []
-    for divisor in range(1, math.isqrt(value) + 1):
-        if value % divisor:
-            continue
-        result.append(divisor)
-        if divisor * divisor != value:
-            result.append(value // divisor)
-    return sorted(result)
 
 
 def _finalize_rows(rows: int) -> int:
@@ -85,12 +63,12 @@ def _fits_shared_memory(operation, device, block_size: int, threads: int, values
 
 def _token_candidates(operation, device, block_size: int):
     dynamic_scale_mode = operation.quant_mode.dynamic_scale_mode
-    for values in _powers(min(operation.hidden_size, operation.tile_size, block_size)):
+    for values in powers_of_two_up_to(min(operation.hidden_size, operation.tile_size, block_size)):
         if not _valid_values(operation, values, block_size):
             continue
         lanes = operation.hidden_size // values
         unit = max(32, block_size // values)
-        threads = _ceil_div(lanes, unit) * unit
+        threads = ceil_div(lanes, unit) * unit
         if not 32 <= threads <= 1024:
             continue
         if dynamic_scale_mode == "group_token" and (values > 32 or threads & (threads - 1)):
@@ -115,25 +93,25 @@ def _token_candidates(operation, device, block_size: int):
 def _tile_candidates(operation, device, block_size: int):
     num_tiles = operation.num_tiles
     first_tile_count = max(1, block_size // operation.tile_size)
-    divisors = [count for count in _divisors(num_tiles) if count >= first_tile_count]
+    divisors = [count for count in positive_divisors(num_tiles) if count >= first_tile_count]
     pure_hadamard = not operation.should_quantize and operation.activation_type == ActivationType.None_
     pure_hadamard &= operation.hadamard_block_size > 1
     if pure_hadamard:
-        powers = [count for count in _powers(num_tiles) if count >= first_tile_count]
+        powers = [count for count in powers_of_two_up_to(num_tiles) if count >= first_tile_count]
         tile_counts = [count for count in sorted(set(powers + divisors)) if count <= 16]
     else:
-        powers = [count for count in _powers(num_tiles) if count >= first_tile_count]
+        powers = [count for count in powers_of_two_up_to(num_tiles) if count >= first_tile_count]
         tile_counts = sorted(set(powers + divisors))
 
     for tiles_per_block in tile_counts:
         columns = tiles_per_block * operation.tile_size
-        for values in _powers(min(operation.tile_size, block_size)):
+        for values in powers_of_two_up_to(min(operation.tile_size, block_size)):
             if not _valid_values(operation, values, block_size):
                 continue
             tile_lanes = operation.tile_size // values
             transform_lanes = block_size // values
             unit = max(32, tile_lanes, transform_lanes)
-            threads = _ceil_div(columns // values, unit) * unit
+            threads = ceil_div(columns // values, unit) * unit
             if threads % 32 or not 32 <= threads <= 1024:
                 continue
             if transform_lanes > 32 and threads // transform_lanes > 16:
@@ -153,11 +131,11 @@ def _tile_candidates(operation, device, block_size: int):
 
 
 def _token_score(operation, device, plan: ProcessInputPlan):
-    blocks = _ceil_div(operation.schedule_rows, plan.tokens_per_block)
+    blocks = ceil_div(operation.schedule_rows, plan.tokens_per_block)
     resident = min(16, device.max_threads_per_sm // plan.threads)
     wave_blocks = device.sm_count * resident
     full_waves, remaining = divmod(blocks, wave_blocks)
-    remaining_slots = _ceil_div(remaining, device.sm_count) if remaining else 0
+    remaining_slots = ceil_div(remaining, device.sm_count) if remaining else 0
     slots = full_waves * resident + remaining_slots
 
     transform_stages = operation.hadamard_block_size.bit_length() - 1
@@ -193,7 +171,7 @@ def _direct_group_score(operation, device, plan: ProcessInputPlan):
     if plan.threads > thread_limit or plan.values_per_thread < vector_floor:
         return (2,)
 
-    blocks = operation.schedule_rows * _ceil_div(operation.num_tiles, plan.tiles_per_block)
+    blocks = operation.schedule_rows * ceil_div(operation.num_tiles, plan.tiles_per_block)
     useful = min(operation.hidden_size, plan.tiles_per_block * operation.tile_size)
     if full_row_friendly:
         idle = plan.threads * plan.values_per_thread - useful
@@ -224,7 +202,7 @@ def _direct_group_score(operation, device, plan: ProcessInputPlan):
 def _partitioned_tile_score(operation, device, plan: ProcessInputPlan):
     """Shared-transform and staged-scale score from grid capacity."""
     rows = operation.schedule_rows
-    blocks = rows * _ceil_div(operation.num_tiles, plan.tiles_per_block)
+    blocks = rows * ceil_div(operation.num_tiles, plan.tiles_per_block)
     target_threads = 128 if device.sm_major < 10 else (64 if operation.hadamard_block_size > 1 else 32)
     if device.sm_major < 10 and operation.working_set_bytes > device.l2_cache_size:
         target_threads *= 2
@@ -243,7 +221,7 @@ def _partitioned_tile_score(operation, device, plan: ProcessInputPlan):
         ActivationType.BinaryInterleaved,
     )
     natural_values = 8 if binary_activation or not operation.should_quantize else 16
-    natural_threads = _ceil_div(operation.hidden_size // natural_values, 32) * 32
+    natural_threads = ceil_div(operation.hidden_size // natural_values, 32) * 32
     raw_unary = operation.activation_type == ActivationType.Unary and not operation.should_quantize
     binary_lowbit = binary_activation and operation.target_bits == 4
     resident_blocks = 4 if raw_unary or binary_lowbit else 1
@@ -288,7 +266,7 @@ def _raw_tile_score(operation, device, plan: ProcessInputPlan):
             abs(plan.threads - target_threads),
         )
     if device.sm_major >= 10 and operation.activation_type == ActivationType.Unary and underfilled:
-        blocks = operation.schedule_rows * _ceil_div(operation.num_tiles, plan.tiles_per_block)
+        blocks = operation.schedule_rows * ceil_div(operation.num_tiles, plan.tiles_per_block)
         target_blocks = 2 * device.sm_count
         return (
             plan.values_per_thread < 4,
@@ -300,7 +278,7 @@ def _raw_tile_score(operation, device, plan: ProcessInputPlan):
             blocks,
         )
     if device.sm_major >= 10 and operation.activation_type == ActivationType.Unary and not underfilled:
-        blocks = operation.schedule_rows * _ceil_div(operation.num_tiles, plan.tiles_per_block)
+        blocks = operation.schedule_rows * ceil_div(operation.num_tiles, plan.tiles_per_block)
         useful = operation.schedule_rows * operation.hidden_size
         capacity = blocks * plan.threads * plan.values_per_thread
         tail_ratio = (capacity - useful) / useful
@@ -364,12 +342,12 @@ def _pure_hadamard_score(operation, device, plan: ProcessInputPlan):
     irregular_tiles = transforms < 16 and transforms & (transforms - 1)
     if underfilled and irregular_tiles:
         values = max(4, natural_values // 2)
-    blocks = operation.schedule_rows * _ceil_div(transforms, plan.tiles_per_block)
+    blocks = operation.schedule_rows * ceil_div(transforms, plan.tiles_per_block)
     columns = plan.tiles_per_block * block_size
     idle = plan.threads * plan.values_per_thread - columns
     if not underfilled:
         target_tiles = min(transforms, values)
-        row_capacity = _ceil_div(transforms, plan.tiles_per_block) * plan.threads * plan.values_per_thread
+        row_capacity = ceil_div(transforms, plan.tiles_per_block) * plan.threads * plan.values_per_thread
         capacity_overhead = (row_capacity - operation.hidden_size) / operation.hidden_size
         tile_error = abs(plan.tiles_per_block - target_tiles) / target_tiles
         return (
@@ -378,7 +356,7 @@ def _pure_hadamard_score(operation, device, plan: ProcessInputPlan):
             idle,
             abs(plan.threads - 128),
         )
-    target_blocks = _ceil_div(3 * device.sm_count, 2)
+    target_blocks = ceil_div(3 * device.sm_count, 2)
     grid_shortfall = max(0, target_blocks - blocks)
     return (
         plan.values_per_thread < 4,

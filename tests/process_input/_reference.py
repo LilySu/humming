@@ -4,6 +4,7 @@ import pytest
 import torch
 
 from humming import ops
+from humming.utils.math import round_up
 
 SCALE_DTYPES = {
     "float32": torch.float32,
@@ -18,14 +19,17 @@ def _empty_group_scales(
     scale_dtype: str,
     scale_layout: str = "row_major",
 ) -> torch.Tensor:
-    stride = (rows + 3) // 4 * 4
+    dtype = SCALE_DTYPES[scale_dtype]
     if scale_layout == "row_major":
         shape = (rows, groups)
     elif scale_layout == "m_major":
+        alignment = 16 // torch.empty((), dtype=dtype).element_size()
+        stride = round_up(rows, alignment)
         shape = (groups, stride)
     else:
+        stride = round_up(rows, 4)
         shape = ((groups + 3) // 4, stride, 4)
-    return torch.empty(shape, device="cuda", dtype=SCALE_DTYPES[scale_dtype])
+    return torch.empty(shape, device="cuda", dtype=dtype)
 
 
 def _source_after_transform(x: torch.Tensor, block_size: int | None) -> torch.Tensor:

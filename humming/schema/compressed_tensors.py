@@ -346,7 +346,6 @@ class CompressedTensorsInputSchema(BaseInputSchema):
             tensors,
             source_name=self.input_scale_key,
             target_name=schema.static_tensor_scale_name,
-            num_experts=num_experts,
             reciprocal="nvfp4" in self.format,
         )
         return schema, output_tensors

@@ -20,9 +20,8 @@ class ActivationType(str, Enum):
 
 class LayoutType(str, Enum):
     Normal = "normal"
-    Grouped = "grouped"
     Permute = "permute"
-    GroupedPadded = "grouped_padded"
+    GroupedMask = "grouped_mask"
     Scatter = "scatter"
 
 

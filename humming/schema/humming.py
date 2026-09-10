@@ -359,7 +359,6 @@ class HummingInputSchema(BaseInputSchema):
         if self.static_tensor_scale_name is None:
             return {}
         return self._get_input_scale_attrs(
-            num_experts=num_experts,
             dtype=torch.float32,
             input_scale_name=self.static_tensor_scale_name,
         )
@@ -380,6 +379,5 @@ class HummingInputSchema(BaseInputSchema):
             tensors,
             source_name=self.static_tensor_scale_name,
             target_name=self.static_tensor_scale_name,
-            num_experts=num_experts,
         )
         return schema, tensors

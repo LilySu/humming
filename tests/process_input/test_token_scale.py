@@ -220,28 +220,21 @@ def test_group_token_int8_register_schedules(hadamard_block_size, group_size):
     torch.testing.assert_close(result[0], expected_output, rtol=0, atol=1)
 
 
-@pytest.mark.parametrize("layout", ["grouped", "permute"])
-def test_group_token_moe_compact_layouts(layout):
+def test_group_token_permute_layout():
     torch.manual_seed(21)
     x = torch.randn(5, 256, device="cuda")
-    expert_offsets = torch.tensor([0, 2, 5], device="cuda", dtype=torch.int32)
-    permute_idx = None
-    input_rows = torch.arange(5, device="cuda")
-    if layout == "permute":
-        permute_idx = torch.tensor([3, 1, 4, 0, 2], device="cuda", dtype=torch.int64)
-        input_rows = permute_idx
+    permute_idx = torch.tensor([3, 1, 4, 0, 2], device="cuda", dtype=torch.int64)
 
     result = process_input(
         x,
         quant_mode="dynamic_group_token",
         quant_dtype="float8e4m3",
         quant_group_size=128,
-        layout=layout,
-        expert_layout=expert_offsets,
+        layout="permute",
         indices=permute_idx,
     )
 
-    grouped = x[input_rows].reshape(5, 2, 128)
+    grouped = x[permute_idx].reshape(5, 2, 128)
     raw = grouped.abs().amax(-1) / 448.0
     m3 = _round_positive_m3_rne(raw)
     expected_token = torch.exp2(torch.ceil(torch.log2(m3.amax(-1) / 448.0)))
@@ -284,7 +277,7 @@ def test_group_token_m_major_scale_layout(packed):
         unpacked = m_major[1][0, :5]
         expected_group_scales = row_major[1]
     else:
-        assert m_major[1].shape == (4, 8)
+        assert m_major[1].shape == (4, 16)
         assert m_major[1].dtype == torch.float8_e4m3fn
         unpacked = m_major[1][:, :5].T
         expected_group_scales = row_major[1]

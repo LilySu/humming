@@ -452,11 +452,6 @@ class HummingKernel(KernelRuntime, LayerConfig, ComputeConfig, TuningConfig):
         if self.gemm_type is None and self.num_experts == 0:
             self.gemm_type = GemmType.DENSE
         assert self.gemm_type is not None, "gemm_type must be specify for MoE GEMM"
-        if self.is_indexed_gemm and self.num_experts > 1:
-            assert not self.input_quant_mode.has_static_tensor_scale, (
-                "indexed GEMM cannot use per-expert static input scales because "
-                "its quantized inputs are shared across experts"
-            )
         if self.reduce_overlap_last_stage_only:
             assert not self.is_indexed_gemm, "reduce_overlap_last_stage_only does not support indexed GEMM"
 
@@ -469,12 +464,13 @@ class HummingKernel(KernelRuntime, LayerConfig, ComputeConfig, TuningConfig):
             self.use_tma_as = False
             self.use_m_major_input_scale = False
 
-        if self.use_tma_as and self.is_indexed_gemm:
+        if self.is_indexed_gemm:
             self.use_tma_as = False
-            self.use_m_major_input_scale = True
-        if not self.has_input_scale_2 or self.is_tensor_input_scale_2:
             self.use_tma_as2 = False
-        elif self.use_tma_as2 and self.is_indexed_gemm:
+        if self.is_grouped_gemm and self.block_shape[0] + 4 > 256:
+            self.use_tma_as = False
+            self.use_tma_as2 = False
+        if not self.has_input_scale_2 or self.is_tensor_input_scale_2:
             self.use_tma_as2 = False
 
         if self.is_indexed_gemm:

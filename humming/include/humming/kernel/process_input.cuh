@@ -248,7 +248,7 @@ __global__ __launch_bounds__(Config::kThreads) void process_input_kernel(
       uint32_t group = thread.num_values == 0 ? 0 : thread.column / G;
       float static_scale = 1.f;
       if constexpr (Config::kStaticTensorScale)
-        static_scale *= __ldg(static_tensor_scales + thread.expert);
+        static_scale *= __ldg(static_tensor_scales);
 
       auto result = quant_group<
           TargetType,

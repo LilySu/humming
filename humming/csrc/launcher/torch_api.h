@@ -1,5 +1,7 @@
 #pragma once
 
+#include <cstdint>
+
 #ifndef USE_TORCH_STABLE_API
 #define USE_TORCH_STABLE_API 0
 #endif
@@ -65,3 +67,7 @@ inline Tensor torch_contiguous(const Tensor tensor) {
 };
 
 #endif
+
+inline void check_tensor_data_alignment(const Tensor &tensor, const char *name, uintptr_t alignment = 16) {
+  ASSERT_CHECK(reinterpret_cast<uintptr_t>(tensor.data_ptr()) % alignment == 0, name, ".data_ptr() must be ", alignment, "-byte aligned");
+}

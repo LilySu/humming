@@ -48,9 +48,7 @@ def require_sm100_family(monkeypatch):
     monkeypatch.setattr(torch.backends.cuda.matmul, "allow_tf32", False)
 
     def force_umma(layer_config, shape_m, gemm_type, **kwargs):
-        return Sm100Heuristics.get_umma_config(layer_config, shape_m, gemm_type) | {
-            "mma_type": "umma"
-        }
+        return Sm100Heuristics.get_umma_config(layer_config, shape_m, gemm_type) | {"mma_type": "umma"}
 
     monkeypatch.setattr("humming.testing.tuning.get_heuristics_config", force_umma)
 
@@ -84,9 +82,7 @@ def _assert_results(case, shape_ms):
     results = runner.run(shape_ms)
     assert {result.shape_m for result in results} == set(shape_ms)
     for result in results:
-        torch.testing.assert_close(
-            result.outputs, result.outputs_ref, rtol=case.rtol, atol=case.atol
-        )
+        torch.testing.assert_close(result.outputs, result.outputs_ref, rtol=case.rtol, atol=case.atol)
 
 
 @pytest.mark.parametrize("gemm_type", list(GemmType))
@@ -111,9 +107,7 @@ def test_umma_pipeline_stage_reuse(gemm_type, block_m, shape_k, monkeypatch):
     """Retire async reads before reuse across persistent tiles and experts."""
     weights = WEIGHT_CONFIGS["uint4-zp"] | {"weight_scale_group_size": 64}
     case = _case("pipeline-stage-reuse", gemm_type, **weights)
-    case = dataclasses.replace(
-        case, layer_config=dataclasses.replace(case.layer_config, shape_k=shape_k)
-    )
+    case = dataclasses.replace(case, layer_config=dataclasses.replace(case.layer_config, shape_k=shape_k))
 
     def minimum_stages(layer_config, shape_m, gemm_type, **kwargs):
         return Sm100Heuristics.get_umma_config(layer_config, shape_m, gemm_type) | {
@@ -170,9 +164,7 @@ def test_umma_integer_weight_widths(bits, gemm_type):
     "weight_values",
     [
         dict(b_dtype="uint3", bs_dtype="float8e5m2", weight_scale_group_size=64),
-        dict(
-            b_dtype="uint3", weight_scale_group_size=64, weight_scale_2_type="channel"
-        ),
+        dict(b_dtype="uint3", weight_scale_group_size=64, weight_scale_2_type="channel"),
         dict(b_dtype="uint4", bs_dtype="float32", weight_scale_type="tensor"),
         dict(
             b_dtype="uint4",
@@ -193,28 +185,23 @@ def _public_problem(weight_ref, shape_m, gemm_type, block_m):
     device = weight_ref.device
     shape_k = weight_ref.shape[-1]
     if gemm_type == GemmType.DENSE:
-        inputs = generate_random_tensor(
-            (shape_m, shape_k), torch.bfloat16, device=device
-        )
+        inputs = generate_random_tensor((shape_m, shape_k), torch.bfloat16, device=device)
         return dict(inputs=inputs), slice(None), inputs.float() @ weight_ref.T
 
     # Leave experts 1 and 3 empty; experts 0 and 2 have tail tiles.
     topk_ids = torch.tensor([0, 2], device=device, dtype=torch.int32)
     topk_ids = topk_ids.expand(shape_m, -1).contiguous()
+    expert_max_tokens = shape_m + 3
     _, layout, sorted_ids, expert_ids, padded = generate_moe_tensors(
         topk_ids,
         4,
         gemm_type,
         block_size_config=block_m,
-        expert_max_tokens=shape_m + 3,
+        expert_max_tokens=expert_max_tokens,
     )
     if gemm_type == GemmType.INDEXED:
-        inputs = generate_random_tensor(
-            (shape_m, shape_k), torch.bfloat16, device=device
-        )
-        reference = torch.stack(
-            [inputs.float() @ weight_ref[e].T for e in (0, 2)], dim=1
-        ).flatten(0, 1)
+        inputs = generate_random_tensor((shape_m, shape_k), torch.bfloat16, device=device)
+        reference = torch.stack([inputs.float() @ weight_ref[e].T for e in (0, 2)], dim=1).flatten(0, 1)
         return (
             dict(
                 inputs=inputs,
@@ -227,16 +214,12 @@ def _public_problem(weight_ref, shape_m, gemm_type, block_m):
             reference,
         )
 
-    total_m = (
-        shape_m * 2 if gemm_type == GemmType.GROUPED_CONTIGUOUS else 4 * (shape_m + 3)
-    )
+    total_m = shape_m * 2 if gemm_type == GemmType.GROUPED_CONTIGUOUS else 4 * expert_max_tokens
     inputs = generate_random_tensor((total_m, shape_k), torch.bfloat16, device=device)
     output_ids, references = [], []
     for expert in (0, 2):
         offset = (
-            int(layout[expert])
-            if gemm_type == GemmType.GROUPED_CONTIGUOUS
-            else expert * (shape_m + 3)
+            int(layout[expert]) if gemm_type == GemmType.GROUPED_CONTIGUOUS else expert * expert_max_tokens
         )
         ids = torch.arange(offset, offset + shape_m, device=device)
         output_ids.append(ids)
@@ -256,9 +239,9 @@ def _public_layer(weight_name, gemm_type, shape_n=256, shape_k=256):
     weight = generate_random_tensor(weight_shape, torch.bfloat16, device="cuda")
     tensors = schema.quant_tensor(weight, schema, torch.bfloat16)
     if num_experts and "weight_scale_2" in tensors:
-        tensors["weight_scale_2"] *= torch.arange(
-            1, num_experts + 1, device=weight.device
-        ).reshape_as(tensors["weight_scale_2"])
+        tensors["weight_scale_2"] *= torch.arange(1, num_experts + 1, device=weight.device).reshape_as(
+            tensors["weight_scale_2"]
+        )
     weight_ref = schema.dequant_tensors(tensors)
     layer = HummingLayer(
         shape_n=shape_n,
@@ -309,11 +292,7 @@ def test_umma_public_layer_switches_without_repacking(weight_name, gemm_type):
             if mma_type is None
             else dataclasses.replace(layer.humming_config, mma_type=mma_type)
         )
-        get_config = (
-            Sm100Heuristics.get_umma_config
-            if mma_type == MmaType.UMMA
-            else get_heuristics_config
-        )
+        get_config = Sm100Heuristics.get_umma_config if mma_type == MmaType.UMMA else get_heuristics_config
         tuning = get_config(
             config,
             shape_m=shape_m * (2 if num_experts else 1),
@@ -329,22 +308,16 @@ def test_umma_public_layer_switches_without_repacking(weight_name, gemm_type):
             compute_config={"gemm_type": gemm_type.value},
             tuning_config=tuning if mma_type is not None else None,
         )
-        actual_mma = _selected_backend(
-            layer, gemm_type, kwargs, tuning if mma_type is not None else None
-        )
+        actual_mma = _selected_backend(layer, gemm_type, kwargs, tuning if mma_type is not None else None)
         assert actual_mma == (mma_type or MmaType.MMA)
-        torch.testing.assert_close(
-            outputs[output_ids], reference.to(torch.bfloat16), rtol=0.01, atol=0.05
-        )
+        torch.testing.assert_close(outputs[output_ids], reference.to(torch.bfloat16), rtol=0.01, atol=0.05)
     for name, value in layer.named_parameters():
         pointer, original = packed[name]
         assert pointer == value.data_ptr()
         assert torch.equal(value.detach().view(torch.uint8), original)
 
 
-@pytest.mark.parametrize(
-    "gemm_type", (GemmType.DENSE, GemmType.INDEXED, GemmType.GROUPED_CONTIGUOUS)
-)
+@pytest.mark.parametrize("gemm_type", (GemmType.DENSE, GemmType.INDEXED, GemmType.GROUPED_CONTIGUOUS))
 def test_umma_default_prefill_switches_back_to_decode(gemm_type):
     """The public default selects UMMA for prefill on a reused packed layer."""
     layer, weight_ref = _public_layer("uint4", gemm_type, 5120, 2048)
@@ -367,9 +340,7 @@ def test_umma_default_prefill_switches_back_to_decode(gemm_type):
         )
         outputs = layer(**kwargs, compute_config={"gemm_type": gemm_type.value})
         assert _selected_backend(layer, gemm_type, kwargs) == expected
-        torch.testing.assert_close(
-            outputs[output_ids], reference.to(torch.bfloat16), rtol=0.01, atol=0.05
-        )
+        torch.testing.assert_close(outputs[output_ids], reference.to(torch.bfloat16), rtol=0.01, atol=0.05)
     for name, value in layer.named_parameters():
         pointer, original = packed[name]
         assert pointer == value.data_ptr()

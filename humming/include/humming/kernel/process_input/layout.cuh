@@ -5,16 +5,14 @@
 
 enum class LayoutType : uint32_t {
   Normal = 0,
-  Grouped = 1,
   Permute = 2,
-  GroupedPadded = 3,
+  GroupedMask = 3,
   Scatter = 4,
 };
 
 
 struct InputLayoutParams {
-  // Grouped/permute: E + 1 expert row offsets.
-  // GroupedPadded: E valid-token counts.
+  // GroupedMask: E valid-token counts.
   const void *expert_layout;
   // Permute: output row -> input row.
   // Scatter: input row * kScatterWidth + route -> output row.
@@ -85,7 +83,7 @@ public:
   static_assert(kType != LayoutType::Scatter || kIndexInt64);
   static_assert(!kScatterSingleOutput || kType == LayoutType::Scatter);
   static_assert(!kDirectScatter_ || kType == LayoutType::Scatter);
-  static_assert(!kZeroInvalid || kType == LayoutType::GroupedPadded);
+  static_assert(!kZeroInvalid || kType == LayoutType::GroupedMask);
 
   struct BlockTask {
     uint64_t first_token;
@@ -297,21 +295,6 @@ private:
     }
   }
 
-  CUDA_INLINE uint32_t find_expert(uint64_t row) const {
-    uint32_t lo = 0;
-    uint32_t hi = params_.num_experts;
-    while (lo < hi) {
-      uint32_t mid = lo + (hi - lo) / 2;
-      uint64_t end = static_cast<uint64_t>(load_index<kExpertLayoutInt64>(params_.expert_layout, mid + 1));
-      if (row >= end) {
-        lo = mid + 1;
-      } else {
-        hi = mid;
-      }
-    }
-    return lo;
-  }
-
   CUDA_INLINE TokenTask map_token(uint64_t logical_row) const {
     TokenTask task{};
     PRAGMA_UNROLL
@@ -332,17 +315,11 @@ private:
         task.load = logical_row < params_.num_input_rows;
       }
       if (task.load) task.output_rows[0] = logical_row;
-    } else if constexpr (kType == LayoutType::Grouped || kType == LayoutType::Permute) {
-      task.expert = find_expert(logical_row);
-      if (task.expert >= params_.num_experts) return task;
-      if constexpr (kType == LayoutType::Permute) {
-        task.input_row = static_cast<uint64_t>(load_index<kIndexInt64>(params_.indices, logical_row));
-      } else {
-        task.input_row = logical_row;
-      }
+    } else if constexpr (kType == LayoutType::Permute) {
+      task.input_row = static_cast<uint64_t>(load_index<kIndexInt64>(params_.indices, logical_row));
       task.load = task.input_row < params_.num_input_rows;
       if (task.load) task.output_rows[0] = logical_row;
-    } else if constexpr (kType == LayoutType::GroupedPadded) {
+    } else if constexpr (kType == LayoutType::GroupedMask) {
       task.expert = static_cast<uint32_t>(logical_row / params_.max_tokens_per_expert);
       if (task.expert >= params_.num_experts) return task;
       uint32_t local_row = static_cast<uint32_t>(logical_row % params_.max_tokens_per_expert);

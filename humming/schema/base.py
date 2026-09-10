@@ -6,6 +6,7 @@ import torch
 
 from humming import dtypes
 from humming.device import current_device
+from humming.utils.math import round_up
 
 if TYPE_CHECKING:
     from humming.schema.humming import HummingInputSchema, HummingWeightSchema
@@ -51,8 +52,8 @@ class BaseWeightSchema:
         pad_k_to_multiple: int = 1,
         stack_size: int = 1,
     ) -> dict[str, dict[str, Any]]:
-        padded_shape_n = math.ceil(shape_n / pad_n_to_multiple) * pad_n_to_multiple
-        padded_shape_k = math.ceil(shape_k / pad_k_to_multiple) * pad_k_to_multiple
+        padded_shape_n = round_up(shape_n, pad_n_to_multiple)
+        padded_shape_k = round_up(shape_k, pad_k_to_multiple)
 
         tensors_attrs = self.get_tensors_attrs(
             shape_n=shape_n,
@@ -297,14 +298,12 @@ class BaseInputSchema:
         tensors: dict[str, torch.Tensor],
         source_name: str,
         target_name: str,
-        num_experts: int | None = None,
         reciprocal: bool = False,
     ) -> dict[str, torch.Tensor]:
-        """Convert checkpoint per-stack scales to Humming per-tensor scales."""
-        scale = tensors[source_name].view(num_experts or 1, -1).float()
+        scale = tensors[source_name].float()
         if reciprocal:
             scale = scale.reciprocal()
-        scale = scale.amax(dim=-1)
+        scale = scale.amax().reshape(1)
         return {target_name: scale.contiguous()}
 
     def get_tensors_attrs(

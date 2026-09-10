@@ -5,6 +5,7 @@ import numpy as np
 from humming import dtypes
 from humming.config import GemmType, LayerConfig
 from humming.device import current_device
+from humming.utils.math import round_up
 from humming.utils.smem import estimate_smem_size_layer
 
 
@@ -84,7 +85,7 @@ class DeviceHeuristics:
         # 2. block_shape_m and warp_shape_m
         if not layer_config.num_experts:
             if shape_m <= block_shape_m:
-                block_shape_m = math.ceil(shape_m / 16) * 16
+                block_shape_m = round_up(shape_m, 16)
             else:
                 blocks = [math.ceil(shape_m / ((i + 1) * 16)) for i in range(block_shape_m // 16)]
                 block_shape_m = np.argmin(blocks).item() * 16 + 16
@@ -96,9 +97,9 @@ class DeviceHeuristics:
             new_shape_m = int(shape_m / layer_config.num_experts / 0.9)
             new_shape_m = max(new_shape_m, 1)
             if block_shape_m == 128:
-                if np.ceil(new_shape_m / 96) * 96 < np.ceil(new_shape_m / 64) * 64:
+                if round_up(new_shape_m, 96) < round_up(new_shape_m, 64):
                     block_shape_m = 96
-                elif np.ceil(new_shape_m / 128) * 128 < np.ceil(new_shape_m / 64) * 64 * 1.05:
+                elif round_up(new_shape_m, 128) < round_up(new_shape_m, 64) * 1.05:
                     block_shape_m = 128
                 else:
                     block_shape_m = moe_block_size
@@ -109,7 +110,7 @@ class DeviceHeuristics:
 
         assert num_warps_m <= 2
         if num_warps_m == 2 and block_shape_m >= 64:
-            block_shape_m = math.ceil(block_shape_m / 32) * 32
+            block_shape_m = round_up(block_shape_m, 32)
             warp_shape_m = block_shape_m // 2
         elif num_warps_m == 2 and block_shape_m % 32 == 0:
             warp_shape_m = block_shape_m // 2
@@ -244,7 +245,7 @@ class DeviceHeuristics:
 
             if cls.sm_version != 75:
                 num_warps_m = block_shape_m // warp_shape_m
-                warp_shape_m = math.ceil(warp_shape_m / 16) * 16
+                warp_shape_m = round_up(warp_shape_m, 16)
                 block_shape_m = num_warps_m * warp_shape_m
 
         while layer_config.shape_k % block_shape_k != 0:

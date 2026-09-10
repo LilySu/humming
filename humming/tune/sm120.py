@@ -4,6 +4,7 @@ from humming import dtypes
 from humming.config import GemmType, MmaType
 from humming.device import current_device
 from humming.tune.sm8x import Sm89Heuristics
+from humming.utils.math import round_up
 from humming.utils.smem import estimate_smem_size_layer
 
 
@@ -54,7 +55,7 @@ class Sm120Heuristics(Sm89Heuristics):
         ]
         return min(
             candidates,
-            key=lambda candidate: (math.ceil(shape_m / candidate) * candidate, -candidate),
+            key=lambda candidate: (round_up(shape_m, candidate), -candidate),
             default=block_shape_m,
         )
 

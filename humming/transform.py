@@ -1,11 +1,10 @@
-import math
-
 import torch
 
 from humming import dtypes, ops
 from humming.config import LayerConfig, MmaType, WeightScale2Type, WeightScaleType
 from humming.device import DeviceInfo
 from humming.schema import HummingInputSchema, HummingWeightSchema
+from humming.utils.math import round_up
 
 
 def prepare_layer_config(
@@ -28,8 +27,8 @@ def prepare_layer_config(
             torch_dtype = torch.bfloat16 if info.sm_major >= 8 else torch.float16
 
     f16_dtype = dtypes.DataType.from_torch_dtype(torch_dtype)
-    pad_shape_n = math.ceil(shape_n / pad_n_to_multiple) * pad_n_to_multiple - shape_n
-    pad_shape_k = math.ceil(shape_k / pad_k_to_multiple) * pad_k_to_multiple - shape_k
+    pad_shape_n = round_up(shape_n, pad_n_to_multiple) - shape_n
+    pad_shape_k = round_up(shape_k, pad_k_to_multiple) - shape_k
 
     if input_schema is None:
         input_schema = HummingInputSchema(a_dtype=f16_dtype)

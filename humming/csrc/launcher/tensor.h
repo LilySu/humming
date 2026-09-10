@@ -30,11 +30,13 @@ inline void check_tensor_common(
     const Tensor &tensor, std::string name,
     int64_t expected_dev,
     ScalarType expected_dtype,
-    std::optional<std::vector<int64_t>> expected_shape_ = std::nullopt) {
+    std::optional<std::vector<int64_t>> expected_shape_ = std::nullopt,
+    bool require_data_alignment = true) {
 
   ASSERT_CHECK(tensor.is_contiguous(), "error: ", name, ".is_contiguous() != true");
   ASSERT_CHECK(tensor.is_cuda(), "error: ", name, ".is_cuda() != true");
   ASSERT_CHECK(tensor.get_device() == expected_dev, "error: ", name, ".get_device() != a.get_device()");
+  if (require_data_alignment) check_tensor_data_alignment(tensor, name.c_str());
 
   if (expected_shape_.has_value()) {
     auto &expected_shape = expected_shape_.value();
@@ -107,10 +109,6 @@ inline void check_tensor_as(std::optional<Tensor> &tensor, KernelData &kernel_da
   uint32_t num_groups = group_size == 0 ? 1 : CEIL_DIV(problem_shape_k, group_size);
   constexpr int64_t input_scale_m_alignment = 4;
   int64_t m_pad = (shape_m + input_scale_m_alignment - 1) / input_scale_m_alignment * input_scale_m_alignment;
-  if (kernel_data.use_m_major_input_scale && kernel_data.gemm_type_id == 3) {
-    int64_t expert_m = shape_m / kernel_data.num_experts;
-    ASSERT_CHECK(expert_m % input_scale_m_alignment == 0, "expert_m % input_scale_m_alignment != 0");
-  }
   if (kernel_data.mma_type_id == 3 && group_size > 0) {
     std::vector<int64_t> expected_shape;
     if (kernel_data.use_tma_as || kernel_data.use_m_major_input_scale) {
@@ -120,7 +118,7 @@ inline void check_tensor_as(std::optional<Tensor> &tensor, KernelData &kernel_da
     }
     check_tensor_common(tensor.value(), "as", dev, ScalarType::Int, expected_shape);
   } else if (kernel_data.is_tensor_input_scale) {
-    std::vector<int64_t> expected_shape = {kernel_data.num_experts > 0 ? kernel_data.num_experts : 1};
+    std::vector<int64_t> expected_shape = {1};
     check_tensor_common(tensor.value(), "as", dev, ScalarType::Float, expected_shape);
   } else {
     std::vector<int64_t> expected_shape;
@@ -141,7 +139,7 @@ inline void check_tensor_as2(std::optional<Tensor> &tensor, KernelData &kernel_d
   ASSERT_CHECK(tensor.has_value(), "as2 must not be none for the configured input_quant_mode");
   std::vector<int64_t> expected_shape;
   if (kernel_data.is_tensor_input_scale_2) {
-    expected_shape = {kernel_data.num_experts > 0 ? kernel_data.num_experts : 1};
+    expected_shape = {1};
   } else {
     expected_shape = {shape_m, 1};
   }
@@ -248,29 +246,32 @@ inline void check_tensor_moe(
     std::optional<Tensor> &num_tokens_padded,
     std::optional<Tensor> &expert_layout,
     KernelData &kernel_data,
-    int64_t dev) {
+    int64_t dev,
+    int64_t shape_m) {
 
   if (kernel_data.gemm_type_id == 1) {
     ASSERT_CHECK(sorted_ids.has_value(), "sorted_ids must not be none for indexed gemm");
     ASSERT_CHECK(expert_ids.has_value(), "expert_ids must not be none for indexed gemm");
     ASSERT_CHECK(num_tokens_padded.has_value(), "num_tokens_padded must not be none for indexed gemm");
-    check_tensor_common(sorted_ids.value(), "sorted_ids", dev, ScalarType::Int);
-    check_tensor_common(expert_ids.value(), "expert_ids", dev, ScalarType::Int);
-    check_tensor_common(num_tokens_padded.value(), "num_tokens_padded", dev, ScalarType::Int);
+    check_tensor_common(sorted_ids.value(), "sorted_ids", dev, ScalarType::Int, std::nullopt, false);
+    check_tensor_common(expert_ids.value(), "expert_ids", dev, ScalarType::Int, std::nullopt, false);
+    check_tensor_common(num_tokens_padded.value(), "num_tokens_padded", dev, ScalarType::Int, std::nullopt, false);
   }
   if (kernel_data.gemm_type_id == 2) {
     ASSERT_CHECK(expert_layout.has_value(), "expert_layout must not be none for grouped gemm");
     ASSERT_CHECK(expert_layout.value().scalar_type() == ScalarType::Int || expert_layout.value().scalar_type() == ScalarType::Long,
                  "expert_layout.dtype must be int32 or int64, got ", DTYPE_TO_STRING(expert_layout.value().scalar_type()));
     std::vector<int64_t> expected_shape = {kernel_data.num_experts + 1};
-    check_tensor_common(expert_layout.value(), "expert_token_offset", dev, expert_layout.value().scalar_type(), expected_shape);
+    check_tensor_common(expert_layout.value(), "expert_token_offset", dev, expert_layout.value().scalar_type(), expected_shape, false);
   }
   if (kernel_data.gemm_type_id == 3) {
+    ASSERT_CHECK(kernel_data.num_experts > 0, "grouped masked requires at least one expert");
+    ASSERT_CHECK(shape_m % kernel_data.num_experts == 0, "grouped masked input rows must divide evenly by experts");
     ASSERT_CHECK(expert_layout.has_value(), "expert_layout must not be none for grouped gemm");
     ASSERT_CHECK(expert_layout.value().scalar_type() == ScalarType::Int || expert_layout.value().scalar_type() == ScalarType::Long,
                  "expert_layout.dtype must be int32 or int64, got ", DTYPE_TO_STRING(expert_layout.value().scalar_type()));
     std::vector<int64_t> expected_shape = {kernel_data.num_experts};
-    check_tensor_common(expert_layout.value(), "expert_num_tokens", dev, expert_layout.value().scalar_type(), expected_shape);
+    check_tensor_common(expert_layout.value(), "expert_num_tokens", dev, expert_layout.value().scalar_type(), expected_shape, false);
   }
 };
 
@@ -299,6 +300,7 @@ inline CUtensorMap make_tma_desc_as(std::optional<Tensor> &tensor_, KernelData &
   if (!tensor_.has_value() || !kernel_data.use_tma_as) return CUtensorMap();
 
   uint32_t block_shape_m = kernel_data.block_shape_m;
+  if (kernel_data.gemm_type_id == 2 || kernel_data.gemm_type_id == 3) block_shape_m += 4;
   uint32_t block_shape_k = kernel_data.block_shape_k;
   uint32_t group_size = kernel_data.input_scale_group_size;
   uint32_t num_groups = group_size == 0 ? 1 : CEIL_DIV(block_shape_k, group_size);
@@ -320,9 +322,11 @@ inline CUtensorMap make_tma_desc_as(std::optional<Tensor> &tensor_, KernelData &
 inline CUtensorMap make_tma_desc_as2(std::optional<Tensor> &tensor_, KernelData &kernel_data) {
   if (!tensor_.has_value() || !kernel_data.use_tma_as2) return CUtensorMap();
 
+  uint32_t block_shape_m = kernel_data.block_shape_m;
+  if (kernel_data.gemm_type_id == 2 || kernel_data.gemm_type_id == 3) block_shape_m += 4;
   auto tensor = tensor_.value();
   tensor = torch_view_shape(tensor, {-1});
-  return make_tma_desc(tensor, {kernel_data.block_shape_m}, 0, "as2");
+  return make_tma_desc(tensor, {block_shape_m}, 0, "as2");
 }
 
 inline CUtensorMap make_tma_desc_b(Tensor &tensor, KernelData &kernel_data) {

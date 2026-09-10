@@ -153,6 +153,5 @@ class Fp8InputSchema(BaseInputSchema):
             tensors,
             source_name="input_scale",
             target_name=schema.static_tensor_scale_name,
-            num_experts=num_experts,
         )
         return schema, output_tensors

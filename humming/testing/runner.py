@@ -29,11 +29,6 @@ from humming.transform import transform_humming_tensors
 _DEFAULT_SHAPE_MS = (1, 17, 64, 257, 1024, 4096)
 TEST_TUNING_SOURCE_ENV = "HUMMING_TEST_TUNING_SOURCE"
 NUMERICAL_ERROR_LOG_ENV = "HUMMING_TEST_NUMERICAL_ERROR_LOG"
-M_MAJOR_INPUT_SCALE_M_ALIGNMENT = 4
-
-
-def _round_up(value: int, alignment: int) -> int:
-    return (value + alignment - 1) // alignment * alignment
 
 
 def assert_kernel_test_shape_coverage(
@@ -77,10 +72,7 @@ class KernelTestCase:
     def resolve_expert_max_tokens(self, shape_m: int) -> int:
         if self.expert_max_tokens is not None:
             return self.expert_max_tokens
-        expert_max_tokens = shape_m * self.top_k
-        if self.uses_m_major_input_scale:
-            expert_max_tokens = _round_up(expert_max_tokens, M_MAJOR_INPUT_SCALE_M_ALIGNMENT)
-        return expert_max_tokens
+        return shape_m * self.top_k
 
     @property
     def uses_m_major_input_scale(self) -> bool:
@@ -239,6 +231,10 @@ class KernelTestRunner:
         )
         if use_m_major_input_layout:
             _, input_scale, input_scale_2 = process(m_major_scale=True)
+            if config.mma_type == MmaType.MXMMA and input_scale is not None:
+                input_scale = input_scale.view(torch.int32)
+                if input_scale.ndim == 3:
+                    input_scale = input_scale.reshape(input_scale.size(0), input_scale.size(1))
         elif config.mma_type == MmaType.MXMMA and config.input_scale_group_size > 0:
             assert group_scale_ref is not None
             input_scale = group_scale_ref.view(torch.int32).contiguous()
@@ -253,8 +249,6 @@ class KernelTestRunner:
             input_scale = input_scale.unsqueeze(-1)
         if config.input_quant_mode.has_static_tensor_scale:
             tensor_scale = static_scale
-            if config.num_experts:
-                tensor_scale = tensor_scale.expand(config.num_experts).contiguous()
             if config.input_quant_mode.has_secondary_scale:
                 input_scale_2 = tensor_scale
             else:
@@ -329,15 +323,6 @@ class KernelTestRunner:
 
         assert topk_ids is not None
         expert_alignment = 1
-        expert_max_tokens = None
-        if self.test_case.uses_m_major_input_scale:
-            if gemm_type == GemmType.GROUPED_MASKED:
-                expert_max_tokens = self.test_case.resolve_expert_max_tokens(shape_m)
-                if expert_max_tokens % M_MAJOR_INPUT_SCALE_M_ALIGNMENT:
-                    raise RuntimeError("input-scale M dimension 16-byte aligned requirement is not met")
-            if gemm_type == GemmType.GROUPED_CONTIGUOUS:
-                expert_alignment = M_MAJOR_INPUT_SCALE_M_ALIGNMENT
-
         moe_tensors = generate_moe_tensors(
             topk_ids,
             config.num_experts,
@@ -570,7 +555,6 @@ class KernelTestRunner:
                         "input_scale": input_scale,
                         "input_scale_2": input_scale_2,
                     }
-
                 result = self._run_kernel(shape_m, kernel_launch_tensors, kernel, outputs_ref, output_ids)
 
                 if base_outputs is not None:

@@ -109,28 +109,18 @@ def build_sm90_seed_config(problem: TuningProblem) -> dict:
     # Long-K layers need more routed rows before wider N tiles pay off.
     wide_tile_min_shape_m = 64 if layer_config.shape_k > 4096 else 16
     use_wide_indexed_tile = (
-        tune_indexed_a16
-        and block_shape_m <= 64
-        and problem.shape_m >= wide_tile_min_shape_m
+        tune_indexed_a16 and block_shape_m <= 64 and problem.shape_m >= wide_tile_min_shape_m
     )
     if use_wide_indexed_tile:
         warp_shape_n = 64
         # N=512 spills its accumulator at two-CTA residency from M=48 onward.
-        if (
-            layer_config.shape_k <= 512
-            and layer_config.shape_n >= 2048
-            and block_shape_m < 48
-        ):
+        if layer_config.shape_k <= 512 and layer_config.shape_n >= 2048 and block_shape_m < 48:
             block_shape_n = 512
             block_shape_k = 64
         else:
             block_shape_n = 256
             block_shape_k = 128
-    elif (
-        layer_config.shape_n <= 4096
-        and not problem.use_batch_invariant
-        and block_shape_m <= 64
-    ):
+    elif layer_config.shape_n <= 4096 and not problem.use_batch_invariant and block_shape_m <= 64:
         block_shape_n = 128
         block_shape_k = warp_shape_k * 2
         if block_shape_m <= 32:
@@ -219,9 +209,7 @@ def select_grouped_scale(
         max_block_m,
     )
     block_ks = (256, 128, 64) if block_shape_m <= 32 else (128, 64)
-    use_multicast = (
-        problem.gemm_type == GemmType.DENSE and problem.shape_m / block_shape_m >= 4
-    )
+    use_multicast = problem.gemm_type == GemmType.DENSE and problem.shape_m / block_shape_m >= 4
 
     candidates = []
     # Candidate order records measured preference; legality supplies fallbacks.
@@ -264,10 +252,7 @@ def select_grouped_scale(
         None,
     )
     if selected is None:
-        rejected = {
-            analysis.candidate.candidate_id: analysis.rejection_reasons
-            for analysis in analyses
-        }
+        rejected = {analysis.candidate.candidate_id: analysis.rejection_reasons for analysis in analyses}
         raise AssertionError(f"no legal grouped-scale SM90 schedule: {rejected}")
 
     return TuningDecision(
@@ -334,9 +319,7 @@ def _half_k_candidate(
     warp_shape = source.warp_shape
     smaller_block_k = block_shape[2] // 2
     scale_groups_align = all(
-        not group_size
-        or group_size % smaller_block_k == 0
-        or smaller_block_k % group_size == 0
+        not group_size or group_size % smaller_block_k == 0 or smaller_block_k % group_size == 0
         for group_size in (
             problem.layer_config.input_scale_group_size,
             problem.layer_config.weight_scale_group_size,
@@ -439,12 +422,9 @@ def select_indexed_a16(
         if (
             base_analysis.candidate.num_ctas_per_sm == 1
             and half_analysis.legal
-            and half_analysis.candidate.num_ctas_per_sm
-            > base_analysis.candidate.num_ctas_per_sm
+            and half_analysis.candidate.num_ctas_per_sm > base_analysis.candidate.num_ctas_per_sm
         ):
-            eligible_reasons[half_option] = (
-                "halved K because it increased CTA residency"
-            )
+            eligible_reasons[half_option] = "halved K because it increased CTA residency"
 
     for option in options:
         if option.transform != "split_n_widen_k":
@@ -456,15 +436,12 @@ def select_indexed_a16(
         if (
             parent_reason is not None
             and analysis.legal
-            and analysis.candidate.num_ctas_per_sm
-            > parent_analysis.candidate.num_ctas_per_sm
+            and analysis.candidate.num_ctas_per_sm > parent_analysis.candidate.num_ctas_per_sm
             and analysis.waves is not None
             and parent_analysis.waves is not None
             and analysis.waves <= parent_analysis.waves
         ):
-            eligible_reasons[option] = (
-                f"{parent_reason}; split N and widened K without adding a grid wave"
-            )
+            eligible_reasons[option] = f"{parent_reason}; split N and widened K without adding a grid wave"
     selected = max(
         eligible_reasons,
         key=lambda option: option.priority,
@@ -483,9 +460,6 @@ def select_indexed_a16(
         problem=problem,
         family="indexed_a16",
         selected=final_candidate,
-        considered=tuple(
-            final_analysis if option is selected else analyses[option]
-            for option in options
-        ),
+        considered=tuple(final_analysis if option is selected else analyses[option] for option in options),
         reason=eligible_reasons[selected],
     )

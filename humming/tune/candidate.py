@@ -67,9 +67,7 @@ class ScheduleCandidate:
     use_warp_spec: bool = False
     use_tma: bool = False
     use_mbarrier: bool = False
-    _explicit_fields: frozenset[str] = dataclasses.field(
-        default_factory=frozenset, repr=False
-    )
+    _explicit_fields: frozenset[str] = dataclasses.field(default_factory=frozenset, repr=False)
 
     def __post_init__(self) -> None:
         if not self.candidate_id:
@@ -186,27 +184,17 @@ class TuningDecision:
 
     def __post_init__(self) -> None:
         selected_analysis = next(
-            (
-                analysis
-                for analysis in self.considered
-                if analysis.candidate == self.selected
-            ),
+            (analysis for analysis in self.considered if analysis.candidate == self.selected),
             None,
         )
         if selected_analysis is None:
-            raise ValueError(
-                "selected candidate must be present in considered analyses"
-            )
+            raise ValueError("selected candidate must be present in considered analyses")
         if not selected_analysis.legal:
             raise ValueError("selected candidate must be legal")
 
     @property
     def selected_analysis(self) -> CandidateAnalysis:
-        return next(
-            analysis
-            for analysis in self.considered
-            if analysis.candidate == self.selected
-        )
+        return next(analysis for analysis in self.considered if analysis.candidate == self.selected)
 
     def to_config(self) -> dict[str, Any]:
         return self.selected.to_config()
@@ -290,21 +278,13 @@ def get_problem_rejection_reasons(
     reasons: list[str] = []
     input_group_size = layer_config.input_scale_group_size
     unpadded_shape_k = layer_config.shape_k - layer_config.pad_shape_k
-    if (
-        input_group_size
-        and layer_config.shape_k != input_group_size
-        and unpadded_shape_k % input_group_size
-    ):
-        reasons.append(
-            f"unpadded shape_k={unpadded_shape_k} is not divisible by "
-            f"input scale group={input_group_size}"
-        )
+    if input_group_size and layer_config.shape_k != input_group_size and unpadded_shape_k % input_group_size:
+        msg = f"unpadded shape_k={unpadded_shape_k} is not divisible by input scale group={input_group_size}"
+        reasons.append(msg)
     if layer_config.mma_type != MmaType.WGMMA:
         return tuple(reasons)
     if layer_config.a_dtype.num_bits != 16 and layer_config.as_dtype != dtypes.float32:
-        reasons.append(
-            f"WGMMA input scales must use float32 storage, got {layer_config.as_dtype}"
-        )
+        reasons.append(f"WGMMA input scales must use float32 storage, got {layer_config.as_dtype}")
     mma_k = 256 // layer_config.a_dtype.num_bits
     scale_groups = (
         ("input scale group", layer_config.input_scale_group_size),
@@ -314,10 +294,7 @@ def get_problem_rejection_reasons(
         if group_size and group_size < mma_k:
             reasons.append(f"{name}={group_size} is smaller than MMA K={mma_k}")
     if 1 < layer_config.weight_scale_group_size_n < 64:
-        reasons.append(
-            "weight scale N group="
-            f"{layer_config.weight_scale_group_size_n} is smaller than 64"
-        )
+        reasons.append(f"weight scale N group={layer_config.weight_scale_group_size_n} is smaller than 64")
     if (
         layer_config.is_block_weight_scale
         and layer_config.input_scale_group_size
@@ -340,15 +317,9 @@ def _analyze_geometry(
         return _GeometryAnalysis(tuple(reasons), None)
 
     if layer_config.shape_n % block_shape[1]:
-        reasons.append(
-            f"shape_n={layer_config.shape_n} is not divisible by "
-            f"block_n={block_shape[1]}"
-        )
+        reasons.append(f"shape_n={layer_config.shape_n} is not divisible by block_n={block_shape[1]}")
     if layer_config.shape_k % block_shape[2]:
-        reasons.append(
-            f"shape_k={layer_config.shape_k} is not divisible by "
-            f"block_k={block_shape[2]}"
-        )
+        reasons.append(f"shape_k={layer_config.shape_k} is not divisible by block_k={block_shape[2]}")
     if block_shape[0] > 256:
         reasons.append(f"block_m={block_shape[0]} exceeds 256")
     for name, size in (
@@ -364,14 +335,10 @@ def _analyze_geometry(
     if warp_shape[1] > 64:
         reasons.append(f"warp_n={warp_shape[1]} exceeds 64")
     if any(block % warp for block, warp in zip(block_shape, warp_shape, strict=True)):
-        reasons.append(
-            f"block_shape={block_shape} does not nest warp_shape={warp_shape}"
-        )
+        reasons.append(f"block_shape={block_shape} does not nest warp_shape={warp_shape}")
         ratios = None
     else:
-        ratios = tuple(
-            block // warp for block, warp in zip(block_shape, warp_shape, strict=True)
-        )
+        ratios = tuple(block // warp for block, warp in zip(block_shape, warp_shape, strict=True))
         if not all(_is_power_of_two(ratio) for ratio in ratios):
             reasons.append(f"block-to-warp ratios must be powers of two: {ratios}")
 
@@ -385,17 +352,12 @@ def _analyze_geometry(
     if layer_config.mma_type == MmaType.WGMMA and ratios is not None:
         if ratios[1] % 4:
             reasons.append(
-                "WGMMA requires the block-N tile to contain a multiple of "
-                f"four warp-N tiles: {ratios[1]}"
+                f"WGMMA requires the block-N tile to contain a multiple of four warp-N tiles: {ratios[1]}"
             )
-        swizzle_bytes = (
-            128 if layer_config.a_dtype.num_bits * block_shape[2] >= 1024 else 64
-        )
+        swizzle_bytes = 128 if layer_config.a_dtype.num_bits * block_shape[2] >= 1024 else 64
         max_warp_k = swizzle_bytes * 8 // layer_config.a_dtype.num_bits
         if warp_shape[2] > max_warp_k:
-            reasons.append(
-                f"warp_k={warp_shape[2]} exceeds WGMMA swizzle limit {max_warp_k}"
-            )
+            reasons.append(f"warp_k={warp_shape[2]} exceeds WGMMA swizzle limit {max_warp_k}")
     return _GeometryAnalysis(tuple(reasons), ratios)
 
 
@@ -420,15 +382,8 @@ def _get_tile_rejection_reasons(
         ("input scale group", problem.layer_config.input_scale_group_size),
         ("weight scale group", problem.layer_config.weight_scale_group_size),
     ):
-        if (
-            group_size
-            and group_size % schedule.block_shape[2]
-            and schedule.block_shape[2] % group_size
-        ):
-            reasons.append(
-                f"block_k={schedule.block_shape[2]} and "
-                f"{scale_name}={group_size} do not nest"
-            )
+        if group_size and group_size % schedule.block_shape[2] and schedule.block_shape[2] % group_size:
+            reasons.append(f"block_k={schedule.block_shape[2]} and {scale_name}={group_size} do not nest")
     if schedule.multi_cast_size_a > 0 and problem.layer_config.shape_n % (
         schedule.block_shape[1] * schedule.multi_cast_size_a
     ):
@@ -440,9 +395,7 @@ def _get_tile_rejection_reasons(
     if problem.use_batch_invariant and (
         schedule.use_stream_k or schedule.block_shape[2] != schedule.warp_shape[2]
     ):
-        reasons.append(
-            "batch-invariant schedules require direct output and one warp-K tile"
-        )
+        reasons.append("batch-invariant schedules require direct output and one warp-K tile")
     return tuple(reasons)
 
 
@@ -452,28 +405,17 @@ def _analyze_execution(
     geometry: _GeometryAnalysis,
 ) -> _ExecutionAnalysis:
     reasons: list[str] = []
-    num_math_threads = (
-        math.prod(geometry.ratios) * 32 if geometry.ratios is not None else 0
-    )
+    num_math_threads = math.prod(geometry.ratios) * 32 if geometry.ratios is not None else 0
     num_load_threads = 128 if schedule.use_warp_spec else num_math_threads
-    num_threads = (
-        num_math_threads + num_load_threads
-        if schedule.use_warp_spec
-        else num_math_threads
-    )
+    num_threads = num_math_threads + num_load_threads if schedule.use_warp_spec else num_math_threads
     if num_threads > 1024:
         reasons.append(f"num_threads={num_threads} exceeds the CTA limit 1024")
     if schedule.use_warp_spec and num_math_threads % 128:
-        reasons.append(
-            "warp specialization requires a multiple of 128 math threads, "
-            f"got {num_math_threads}"
-        )
+        reasons.append(f"warp specialization requires a multiple of 128 math threads, got {num_math_threads}")
     if (schedule.use_warp_spec or schedule.use_tma) and not schedule.use_mbarrier:
         reasons.append("warp specialization and TMA require mbarrier synchronization")
     if problem.layer_config.mma_type == MmaType.WGMMA and schedule.num_stages < 3:
-        reasons.append(
-            f"WGMMA requires at least three stages, got {schedule.num_stages}"
-        )
+        reasons.append(f"WGMMA requires at least three stages, got {schedule.num_stages}")
 
     if schedule.multi_cast_size_a > 1:
         if problem.gemm_type != GemmType.DENSE:
@@ -510,9 +452,7 @@ def _analyze_resources(
         mma_accum_bits=16 if problem.use_f16_accum else 32,
     )
     if smem_size > problem.device.max_smem_size:
-        hard_violations.append(
-            f"smem_size={smem_size} exceeds device limit {problem.device.max_smem_size}"
-        )
+        hard_violations.append(f"smem_size={smem_size} exceeds device limit {problem.device.max_smem_size}")
 
     num_output_tiles = 0
     if (
@@ -530,9 +470,7 @@ def _analyze_resources(
 
     residency_limits: list[int] = []
     if execution.num_threads > 0:
-        residency_limits.append(
-            problem.device.max_threads_per_sm // execution.num_threads
-        )
+        residency_limits.append(problem.device.max_threads_per_sm // execution.num_threads)
     if smem_size > 0:
         residency_limits.append(problem.device.resident_smem_size // smem_size)
     thread_smem_cta_limit = min(residency_limits, default=0)
@@ -545,9 +483,7 @@ def _analyze_resources(
 
     waves = None
     if num_output_tiles > 0 and problem.device.num_sms is not None:
-        waves = math.ceil(
-            num_output_tiles / (problem.device.num_sms * schedule.num_ctas_per_sm)
-        )
+        waves = math.ceil(num_output_tiles / (problem.device.num_sms * schedule.num_ctas_per_sm))
 
     return _ResourceAnalysis(
         hard_violations=tuple(hard_violations),

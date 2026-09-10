@@ -58,8 +58,16 @@ def _apply_m_major_input_scale(
     if not use_m_major_input_scale:
         return
     use_tma = config.get("use_tma", False)
-    if use_tma and layer_config.input_scale_group_size > 0 and gemm_type == GemmType.DENSE:
+    if use_tma and layer_config.input_scale_group_size > 0 and gemm_type != GemmType.INDEXED:
         config["use_tma_as"] = True
+
+
+def _disable_indexed_input_scale_tma(config: dict, gemm_type: GemmType) -> None:
+    if gemm_type == GemmType.INDEXED:
+        config["use_tma_a"] = False
+        config["use_tma_c"] = False
+        config["use_tma_as"] = False
+        config["use_tma_as2"] = False
 
 
 def _apply_raster_group_m(config: dict, layer_config, gemm_type) -> None:
@@ -100,6 +108,7 @@ def _get_heuristics_config(
             gemm_type=gemm_type,
         )
         _apply_m_major_input_scale(config, use_m_major_input_scale, layer_config, gemm_type)
+        _disable_indexed_input_scale_tma(config, gemm_type)
         _apply_raster_group_m(config, layer_config, gemm_type)
         return config
     else:
@@ -111,6 +120,7 @@ def _get_heuristics_config(
         )
         for entry in configs:
             _apply_m_major_input_scale(entry[2], use_m_major_input_scale, layer_config, gemm_type)
+            _disable_indexed_input_scale_tma(entry[2], gemm_type)
             _apply_raster_group_m(entry[2], layer_config, gemm_type)
         return configs
 

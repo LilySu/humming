@@ -9,6 +9,7 @@ from humming import dtypes
 from humming.config.base import BaseHummingConfig
 from humming.config.enum import GemmType, InputQuantizationMode, MmaType, WeightScale2Type, WeightScaleType
 from humming.device import DeviceInfo, current_device
+from humming.utils.math import round_up
 
 
 @functools.cache
@@ -223,10 +224,7 @@ class LayerConfig(BaseHummingConfig):
                 self.mma_type = MmaType.WGMMA
             elif self.mxmma_supported:
                 self.mma_type = MmaType.MXMMA
-            elif (
-                self.sm_version // 10 == 10
-                and self.a_dtype == self.c_dtype == dtypes.bfloat16
-            ):
+            elif self.sm_version // 10 == 10 and self.a_dtype == self.c_dtype == dtypes.bfloat16:
                 from humming.jit.runtime import KernelRuntime
 
                 version = _cuda_compiler_version(KernelRuntime._get_compiler())
@@ -359,7 +357,7 @@ class LayerConfig(BaseHummingConfig):
         num_groups = self.shape_k / (self.weight_scale_group_size or self.shape_k)
         assert self.bs_dtype is not None
         nbytes2 = self.shape_n * num_groups * self.bs_dtype.num_bits // 8
-        nbytes3 = self.shape_n * num_groups * (math.ceil(self.b_dtype.num_bits / 4) * 4) // 8
+        nbytes3 = self.shape_n * num_groups * round_up(self.b_dtype.num_bits, 4) // 8
         nbytes = nbytes1 + nbytes2
         if self.has_zero_point and self.is_fp_zero_point:
             nbytes = nbytes + nbytes2
@@ -412,6 +410,8 @@ class ComputeConfig(BaseHummingConfig):
         self.is_grouped_contiguous_gemm = self.gemm_type == GemmType.GROUPED_CONTIGUOUS
         self.is_grouped_masked_gemm = self.gemm_type == GemmType.GROUPED_MASKED
         self.is_grouped_gemm = self.is_grouped_contiguous_gemm or self.is_grouped_masked_gemm
+        if self.is_indexed_gemm:
+            assert not self.use_m_major_input_scale, "indexed GEMM does not support m-major input scales"
 
     @property
     def gemm_type_id(self):

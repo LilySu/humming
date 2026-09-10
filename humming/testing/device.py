@@ -15,6 +15,7 @@ _A_DTYPE_MIN_SM = {
     dtypes.float16: 75,
 }
 
+
 def _coerce_dtype(value):
     if value is None or isinstance(value, dtypes.DataType):
         return value

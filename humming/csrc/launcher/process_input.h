@@ -217,10 +217,12 @@ inline void check_process_input_tensor(
     const char *name,
     int64_t device,
     ScalarType dtype,
-    bool allow_byte = false) {
+    bool allow_byte = false,
+    bool require_data_alignment = true) {
   ASSERT_CHECK(tensor.is_cuda(), name, " must be a CUDA tensor");
   ASSERT_CHECK(tensor.is_contiguous(), name, " must be contiguous");
   ASSERT_CHECK(tensor.get_device() == device, name, " must be on the input device");
+  if (require_data_alignment) check_tensor_data_alignment(tensor, name);
   bool valid_dtype = tensor.scalar_type() == dtype;
   valid_dtype = valid_dtype || (allow_byte && tensor.scalar_type() == ScalarType::Byte);
   ASSERT_CHECK(valid_dtype, name, " has an invalid dtype");
@@ -229,7 +231,7 @@ inline void check_process_input_tensor(
 inline void check_process_input_index(
     const Tensor &tensor, const char *name, int64_t device, bool int64) {
   ScalarType dtype = int64 ? ScalarType::Long : ScalarType::Int;
-  check_process_input_tensor(tensor, name, device, dtype);
+  check_process_input_tensor(tensor, name, device, dtype, false, false);
 }
 
 inline bool has_static_tensor_scale(InputQuantizationMode mode) {
@@ -260,21 +262,15 @@ inline ProcessInputShape process_input_shape(
 
   if (data.layout == 0) {
     ASSERT_CHECK(!expert_layout.has_value() && !indices.has_value(), "normal layout has no metadata");
-  } else if (data.layout == 1 || data.layout == 2) {
-    ASSERT_CHECK(inputs.dim() == 2 && expert_layout.has_value(), "grouped layout requires expert_layout");
-    ASSERT_CHECK(expert_layout->dim() == 1 && expert_layout->numel() >= 2, "invalid expert_layout");
-    shape.num_experts = expert_layout->numel() - 1;
-    if (data.layout == 1) {
-      ASSERT_CHECK(!indices.has_value(), "grouped layout does not use indices");
-      shape.num_output_rows = inputs.size(0);
-    } else {
-      ASSERT_CHECK(indices.has_value() && indices->dim() == 1, "permute layout requires 1D indices");
-      shape.num_output_rows = indices->numel();
-    }
+  } else if (data.layout == 2) {
+    ASSERT_CHECK(inputs.dim() == 2, "permute layout requires 2D inputs");
+    ASSERT_CHECK(!expert_layout.has_value(), "permute layout does not use expert_layout");
+    ASSERT_CHECK(indices.has_value() && indices->dim() == 1, "permute layout requires 1D indices");
+    shape.num_output_rows = indices->numel();
     shape.num_work_rows = shape.num_output_rows;
   } else if (data.layout == 3) {
-    ASSERT_CHECK(inputs.dim() == 3 && expert_layout.has_value(), "grouped-padded requires expert_layout");
-    ASSERT_CHECK(!indices.has_value(), "grouped-padded layout does not use indices");
+    ASSERT_CHECK(inputs.dim() == 3 && expert_layout.has_value(), "grouped-mask requires expert_layout");
+    ASSERT_CHECK(!indices.has_value(), "grouped-mask layout does not use indices");
     shape.num_experts = inputs.size(0);
     shape.max_tokens_per_expert = inputs.size(1);
     shape.num_output_rows = shape.num_experts * shape.max_tokens_per_expert;
@@ -288,7 +284,13 @@ inline ProcessInputShape process_input_shape(
     shape.num_output_rows = outputs.size(0);
     shape.num_work_rows = inputs.size(0);
   }
-  shape.group_scale_stride = data.scale_layout == 0 ? shape.num_output_rows : CEIL_DIV(shape.num_output_rows, 4) * 4;
+  if (data.scale_layout == 0) {
+    shape.group_scale_stride = shape.num_output_rows;
+  } else {
+    uint32_t scale_entry_bits = data.scale_layout == 2 ? 32 : get_dtype_num_bits(data.group_scale_dtype_id);
+    uint32_t scale_m_alignment = 128 / scale_entry_bits;
+    shape.group_scale_stride = CEIL_DIV(shape.num_output_rows, scale_m_alignment) * scale_m_alignment;
+  }
   return shape;
 }
 
@@ -356,7 +358,7 @@ inline std::optional<Tensor> prepare_process_input_token_scales(
     ASSERT_CHECK(!scales.has_value(), "token_scales is not used by quant_mode");
     return std::nullopt;
   }
-  int64_t elements = static_scale ? shape.num_experts : shape.num_output_rows;
+  int64_t elements = static_scale ? 1 : shape.num_output_rows;
   ASSERT_CHECK(scales.has_value(), "token_scales must be allocated by prepare_process_input");
   check_process_input_tensor(*scales, "token_scales", inputs.get_device(), ScalarType::Float);
   ASSERT_CHECK(scales->numel() == elements, "invalid token_scales size");

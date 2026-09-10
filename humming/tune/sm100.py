@@ -23,12 +23,13 @@ class Sm100Heuristics(Sm80Heuristics):
         gemm_type: GemmType = GemmType.DENSE,
     ):
         if layer_config.mma_type != MmaType.UMMA:
-            return super().get_config(
-                layer_config, shape_m, use_f16_accum, use_batch_invariant, gemm_type
-            )
+            return super().get_config(layer_config, shape_m, use_f16_accum, use_batch_invariant, gemm_type)
         common_weight = layer_config.b_dtype in (
-            dtypes.uint4, dtypes.uint8, dtypes.float4e2m1,
-            dtypes.float8e4m3, dtypes.float8e5m2,
+            dtypes.uint4,
+            dtypes.uint8,
+            dtypes.float4e2m1,
+            dtypes.float8e4m3,
+            dtypes.float8e5m2,
         )
         compatible = (
             layer_config.sm_version // 10 == 10
@@ -51,24 +52,18 @@ class Sm100Heuristics(Sm80Heuristics):
                 and tiles * 2 >= current_device.sm_count
             )
         else:
-            min_m = (
-                1024 if layer_config.shape_k <= 1024
-                else 512 if layer_config.shape_k > 4096
-                else 256
-            )
+            min_m = 1024 if layer_config.shape_k <= 1024 else 512 if layer_config.shape_k > 4096 else 256
             tiles = math.ceil(shape_m / 64) * (layer_config.shape_n // 128)
             profitable = shape_m >= min_m and tiles * 2 >= current_device.sm_count
         if common_weight and compatible and profitable:
             return cls.get_umma_config(layer_config, shape_m, gemm_type)
         mma_layer = dataclasses.replace(layer_config, mma_type=MmaType.MMA)
-        return super().get_config(
-            mma_layer, shape_m, use_f16_accum, use_batch_invariant, gemm_type
-        ) | {"mma_type": MmaType.MMA.value}
+        return super().get_config(mma_layer, shape_m, use_f16_accum, use_batch_invariant, gemm_type) | {
+            "mma_type": MmaType.MMA.value
+        }
 
     @classmethod
-    def get_umma_config(
-        cls, layer_config: LayerConfig, shape_m: int, gemm_type: GemmType
-    ):
+    def get_umma_config(cls, layer_config: LayerConfig, shape_m: int, gemm_type: GemmType):
         if layer_config.num_experts:
             block_m = 128 if shape_m >= 128 * layer_config.num_experts else 64
         else:
@@ -84,8 +79,13 @@ class Sm100Heuristics(Sm80Heuristics):
             ):
                 resident_stages = 4
             smem_size = estimate_smem_size_layer(
-                layer_config, (block_m, 128, 64), gemm_type, resident_stages,
-                warp_shape=(block_m, 32, 64), use_mbarrier=True, use_warp_spec=True,
+                layer_config,
+                (block_m, 128, 64),
+                gemm_type,
+                resident_stages,
+                warp_shape=(block_m, 32, 64),
+                use_mbarrier=True,
+                use_warp_spec=True,
             )
             if 2 * smem_size <= cls.max_smem_size:
                 num_ctas_per_sm = 2

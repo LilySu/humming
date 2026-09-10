@@ -10,6 +10,7 @@ from humming.config import InputQuantizationMode
 from humming.device import DeviceInfo
 from humming.kernel.process_input import ProcessInputKernel
 from humming.ops.utils import init_humming_launcher, register_op
+from humming.utils.math import round_up
 
 from .enums import ActivationType, GroupScaleLayout, LayoutType
 from .plan import select_process_input_plan
@@ -84,7 +85,7 @@ class _ProcessInput:
             assert not self.should_quantize, "inplace does not support quantization"
             unary_activation = self.activation_type in (ActivationType.None_, ActivationType.Unary)
             assert unary_activation, "inplace does not support binary activation"
-            allowed_layouts = (LayoutType.Normal, LayoutType.Grouped, LayoutType.GroupedPadded)
+            allowed_layouts = (LayoutType.Normal, LayoutType.GroupedMask)
             assert self.layout in allowed_layouts, f"inplace does not support {self.layout.value} layout"
             self.outputs = self.inputs
 
@@ -127,23 +128,15 @@ class _ProcessInput:
             assert self.expert_layout is None and self.indices is None
             self.output_leading_shape = tuple(self.inputs.shape[:-1])
             self.num_work_rows = math.prod(self.output_leading_shape)
-        elif self.layout in (LayoutType.Grouped, LayoutType.Permute):
-            assert self.inputs.ndim == 2 and self.expert_layout is not None
-            assert self.expert_layout.ndim == 1 and self.expert_layout.numel() >= 2
-            assert self.expert_layout.dtype in (torch.int32, torch.int64)
-            self.validate_tensor(self.expert_layout)
-            if self.layout == LayoutType.Grouped:
-                assert self.indices is None
-                rows = self.inputs.size(0)
-            else:
-                assert self.indices is not None and self.indices.ndim == 1
-                assert self.indices.dtype in (torch.int32, torch.int64)
-                self.validate_tensor(self.indices)
-                rows = self.indices.numel()
+        elif self.layout == LayoutType.Permute:
+            assert self.inputs.ndim == 2 and self.expert_layout is None
+            assert self.indices is not None and self.indices.ndim == 1
+            assert self.indices.dtype in (torch.int32, torch.int64)
+            self.validate_tensor(self.indices)
+            rows = self.indices.numel()
             self.output_leading_shape = (rows,)
             self.num_work_rows = rows
-            self.num_experts = self.expert_layout.numel() - 1
-        elif self.layout == LayoutType.GroupedPadded:
+        elif self.layout == LayoutType.GroupedMask:
             assert self.inputs.ndim == 3 and self.expert_layout is not None
             assert self.indices is None
             self.num_experts, self.max_tokens_per_expert, _ = self.inputs.shape
@@ -195,16 +188,19 @@ class _ProcessInput:
         if static_tensor:
             assert self.token_scales is not None and self.token_scales.dtype == torch.float32
             self.validate_tensor(self.token_scales)
-            assert self.token_scales.numel() == self.num_experts
+            assert self.token_scales.numel() == 1
         uses_group = self.quant_mode.uses_group_scale
         uses_token = self.quant_mode.has_dynamic_token_scale
         row_major_scales = self.group_scale_layout == GroupScaleLayout.RowMajor
         assert uses_group or row_major_scales, "non-row-major scale layout requires dynamic group scales"
-        padded_rows = (self.num_output_rows + 3) // 4 * 4
         if self.group_scale_layout == GroupScaleLayout.RowMajor:
             self.group_scale_stride = self.num_output_rows
         else:
-            self.group_scale_stride = padded_rows
+            scale_entry_bits = group_scale_dtype.num_bits
+            if self.group_scale_layout == GroupScaleLayout.MxPacked:
+                scale_entry_bits *= 4
+            scale_m_alignment = 128 // scale_entry_bits
+            self.group_scale_stride = round_up(self.num_output_rows, scale_m_alignment)
 
         if uses_group:
             if self.quant_mode.dynamic_scale_mode == "group_token":
@@ -227,8 +223,9 @@ class _ProcessInput:
 
         if uses_token:
             if self.token_scales is None:
-                shape = self.output_leading_shape
-                self.token_scales = torch.empty(shape, dtype=torch.float32, device=self.inputs.device)
+                padded_rows = round_up(self.num_output_rows, 4)
+                storage = torch.empty(padded_rows, dtype=torch.float32, device=self.inputs.device)
+                self.token_scales = storage[: self.num_output_rows].view(self.output_leading_shape)
             else:
                 assert self.token_scales.shape == self.output_leading_shape
                 assert self.token_scales.dtype == torch.float32
@@ -334,7 +331,7 @@ class _ProcessInput:
             layout_width=self.output_width,
             expert_layout_int64=self.expert_layout is not None and self.expert_layout.dtype == torch.int64,
             index_int64=self.indices is not None and self.indices.dtype == torch.int64,
-            zero_invalid=self.zero_invalid and self.layout == LayoutType.GroupedPadded,
+            zero_invalid=self.zero_invalid and self.layout == LayoutType.GroupedMask,
             activation_type=self.activation_type,
             activation_impl=self.activation_impl,
             quant_mode=self.quant_mode,

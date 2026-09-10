@@ -13,12 +13,10 @@ from ._reference import (
 
 def test_raw_permute_and_scatter():
     x = torch.randn(4, 384, device="cuda", dtype=torch.bfloat16)
-    offsets = torch.tensor([0, 2, 4], device="cuda", dtype=torch.int32)
     permutation = torch.tensor([2, 0, 3, 1], device="cuda", dtype=torch.int64)
     permuted = process_input(
         x,
         layout="permute",
-        expert_layout=offsets,
         indices=permutation,
     )[0]
     assert torch.equal(permuted.view(torch.uint8), x[permutation].view(torch.uint8))
@@ -175,17 +173,11 @@ def test_scatter_layout_static_scale_and_m_major_scale():
     assert torch.count_nonzero(result[1][:, 1]) == 0
 
 
-@pytest.mark.parametrize("layout", ["grouped", "permute"])
-def test_moe_compact_layouts(layout):
+def test_permute_layout_static_scale():
     torch.manual_seed(13)
     x = torch.randn(5, 256, device="cuda")
-    expert_offsets = torch.tensor([0, 2, 5], device="cuda", dtype=torch.int32)
-    static_scale = torch.tensor([0.02, 0.04], device="cuda")
-    permute_idx = None
-    input_rows = torch.arange(5, device="cuda")
-    if layout == "permute":
-        permute_idx = torch.tensor([3, 1, 4, 0, 2], device="cuda", dtype=torch.int64)
-        input_rows = permute_idx
+    static_scale = torch.tensor([0.04], device="cuda")
+    permute_idx = torch.tensor([3, 1, 4, 0, 2], device="cuda", dtype=torch.int64)
 
     result = process_input(
         x,
@@ -193,24 +185,22 @@ def test_moe_compact_layouts(layout):
         quant_dtype="int8",
         quant_group_size=128,
         token_scales=static_scale,
-        layout=layout,
-        expert_layout=expert_offsets,
+        layout="permute",
         indices=permute_idx,
     )
 
-    row_scales = torch.tensor([0.02, 0.02, 0.04, 0.04, 0.04], device="cuda").expand(2, -1).T
-    expected = _quantize_int8_reference(x[input_rows], row_scales, 128)
+    expected = _quantize_int8_reference(x[permute_idx], static_scale.expand(5, 2), 128)
     torch.testing.assert_close(result[0], expected, rtol=0, atol=0)
 
 
 @pytest.mark.parametrize("zero_invalid", [False, True])
-def test_moe_grouped_padded_invalid_write_policy(zero_invalid):
+def test_moe_grouped_mask_invalid_write_policy(zero_invalid):
     torch.manual_seed(14)
-    x = torch.randn(2, 4, 256, device="cuda")
+    x = torch.randn(2, 7, 256, device="cuda")
     valid_tokens = torch.tensor([3, 1], device="cuda", dtype=torch.int64)
     outputs = torch.full_like(x, 13, dtype=torch.int8)
-    group_scales = torch.full((2, 4, 2), 7, device="cuda", dtype=torch.float8_e4m3fn)
-    token_scales = torch.full((2, 4), 11, device="cuda", dtype=torch.float32)
+    group_scales = torch.full((2, 7, 2), 7, device="cuda", dtype=torch.float8_e4m3fn)
+    token_scales = torch.full((2, 7), 11, device="cuda", dtype=torch.float32)
 
     result = process_input(
         x,
@@ -221,7 +211,7 @@ def test_moe_grouped_padded_invalid_write_policy(zero_invalid):
         token_scales=token_scales,
         quant_group_size=128,
         hadamard_block_size=128,
-        layout="grouped_padded",
+        layout="grouped_mask",
         expert_layout=valid_tokens,
         zero_invalid=zero_invalid,
     )
@@ -229,7 +219,7 @@ def test_moe_grouped_padded_invalid_write_policy(zero_invalid):
     invalid_groups = torch.cat((result[1][0, 3:].flatten(), result[1][1, 1:].flatten()))
     invalid_tokens = torch.cat((result[2][0, 3:].flatten(), result[2][1, 1:].flatten()))
 
-    valid_mask = torch.arange(4, device="cuda")[None, :] < valid_tokens[:, None]
+    valid_mask = torch.arange(7, device="cuda")[None, :] < valid_tokens[:, None]
     transformed = _hadamard_reference(x, 128).to(x.dtype)[valid_mask]
     grouped = transformed.reshape(-1, 2, 128)
     raw = grouped.abs().amax(-1) / 127.0

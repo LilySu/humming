@@ -2,14 +2,12 @@ import pytest
 
 from humming import dtypes
 from humming.config import ComputeConfig, GemmType, LayerConfig, MmaType
-from humming.device import DeviceInfo
 from humming.testing import (
     KernelTestCase,
     KernelTestRunner,
     assert_kernel_test_shape_coverage,
     skip_if_unsupported,
 )
-from humming.tune.sm90 import Sm90Heuristics
 
 SHAPE_N = 1024
 SHAPE_K = 1024
@@ -55,8 +53,52 @@ def _case(
 
 MOE_CASES = (
     _case("indexed", GemmType.INDEXED),
+    _case(
+        "indexed-static-input",
+        GemmType.INDEXED,
+        a_dtype=dtypes.float8e4m3,
+        input_quant_mode="static_tensor",
+    ),
+    _case(
+        "indexed-static-group-input",
+        GemmType.INDEXED,
+        a_dtype=dtypes.float4e2m1,
+        b_dtype=dtypes.float4e2m1,
+        input_scale_group_size=16,
+        input_quant_mode="static_tensor_dynamic_group",
+        mma_type=MmaType.MXMMA,
+    ),
+    _case(
+        "indexed-dynamic-group-token",
+        GemmType.INDEXED,
+        a_dtype=dtypes.float4e2m1,
+        b_dtype=dtypes.float4e2m1,
+        input_scale_group_size=16,
+        input_quant_mode="dynamic_group_token",
+        mma_type=MmaType.MXMMA,
+    ),
     _case("grouped-contiguous", GemmType.GROUPED_CONTIGUOUS),
+    _case(
+        "grouped-contiguous-dynamic-group-token",
+        GemmType.GROUPED_CONTIGUOUS,
+        use_m_major_input_scale=True,
+        a_dtype=dtypes.float4e2m1,
+        b_dtype=dtypes.float4e2m1,
+        input_scale_group_size=16,
+        input_quant_mode="dynamic_group_token",
+        mma_type=MmaType.MXMMA,
+    ),
     _case("grouped-masked", GemmType.GROUPED_MASKED),
+    _case(
+        "grouped-masked-dynamic-group-token",
+        GemmType.GROUPED_MASKED,
+        use_m_major_input_scale=True,
+        a_dtype=dtypes.float4e2m1,
+        b_dtype=dtypes.float4e2m1,
+        input_scale_group_size=16,
+        input_quant_mode="dynamic_group_token",
+        mma_type=MmaType.MXMMA,
+    ),
     _case(
         "indexed-bias-pad-k",
         GemmType.INDEXED,
@@ -101,46 +143,10 @@ def test_moe(test_case):
     assert test_case.compute_config.gemm_type != GemmType.DENSE
     skip_if_unsupported(a_dtype=config.a_dtype, mma_type=config.mma_type.value)
     results = KernelTestRunner(test_case).run()
+    if test_case.compute_config.gemm_type == GemmType.INDEXED:
+        assert all(not result.tuning_config.use_tma_as for result in results)
+        assert all(not result.tuning_config.use_tma_as2 for result in results)
     assert_kernel_test_shape_coverage(results)
-
-
-def test_grouped_masked_m_major_rejects_unaligned_expert_m():
-    test_case = _case(
-        "m-major-grouped-masked-unaligned",
-        GemmType.GROUPED_MASKED,
-        use_m_major_input_scale=True,
-        expert_max_tokens=2,
-        a_dtype=dtypes.float8e4m3,
-        input_scale_group_size=64,
-        weight_scale_group_size=64,
-    )
-    with pytest.raises(RuntimeError, match="input-scale M dimension 16-byte aligned"):
-        KernelTestRunner(test_case).run((1,))
-
-
-def test_sm90_indexed_a16_fits_ctas_to_resources_and_grid(monkeypatch):
-    layer_config = LayerConfig(
-        shape_n=2688,
-        shape_k=2048,
-        num_experts=128,
-        a_dtype=dtypes.bfloat16,
-        b_dtype=dtypes.uint4,
-        c_dtype=dtypes.bfloat16,
-        bs_dtype=dtypes.bfloat16,
-        weight_scale_group_size=128,
-        mma_type=MmaType.WGMMA,
-    )
-    monkeypatch.setattr(DeviceInfo, "sm_count", property(lambda self: 132))
-
-    config = Sm90Heuristics.get_config(
-        layer_config,
-        shape_m=8,
-        gemm_type=GemmType.INDEXED,
-    )
-
-    assert config["block_shape"][2] == 128
-    assert config["num_ctas_per_sm"] == 2
-    assert not config["use_stream_k"]
 
 
 def test_moe_case_coverage():
@@ -154,4 +160,7 @@ def test_moe_case_coverage():
     assert any(case.layer_config.pad_shape_k for case in MOE_CASES)
     assert {
         case.compute_config.gemm_type for case in MOE_CASES if case.compute_config.use_m_major_input_scale
-    } == {GemmType.GROUPED_CONTIGUOUS, GemmType.GROUPED_MASKED}
+    } == {
+        GemmType.GROUPED_CONTIGUOUS,
+        GemmType.GROUPED_MASKED,
+    }

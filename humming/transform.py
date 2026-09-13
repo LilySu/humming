@@ -250,6 +250,7 @@ def transform_humming_weight(
     interleave_mode: int = 3,
     use_packed_k_layout: bool = False,
     use_native_dequant: bool = False,
+    use_ldmatrix_s4: bool = False,
 ) -> torch.Tensor:
     is_moe = weight.ndim == 3
     weight = weight.unsqueeze(0) if not is_moe else weight
@@ -309,6 +310,10 @@ def transform_humming_weight(
         assert b_dtype.num_bits % 2 == 0, "use_packed_k_layout requires even-bit weight"
         assert not use_fused_e8m0_scale, "use_packed_k_layout is incompatible with fused-e8m0 scale"
 
+    if use_ldmatrix_s4:
+        assert use_packed_k_layout, "use_ldmatrix_s4 requires use_packed_k_layout"
+        assert not should_preprocess_with_zp, "use_ldmatrix_s4 (v1) requires a symmetric weight"
+
     repacked_weight = ops.repack_weight(
         inputs=weight,
         zero_point=zero_point,
@@ -323,6 +328,7 @@ def transform_humming_weight(
         group_size_zp=group_size_zp,
         use_packed_k_layout=use_packed_k_layout,
         use_native_dequant=use_native_dequant,
+        use_ldmatrix_s4=use_ldmatrix_s4,
     )
     return repacked_weight if is_moe else repacked_weight.squeeze(0)
 
@@ -455,6 +461,7 @@ def transform_humming_tensors(
         interleave_mode=interleave_mode,
         use_packed_k_layout=config.use_packed_k_layout,
         use_native_dequant=config.use_native_dequant,
+        use_ldmatrix_s4=config.use_ldmatrix_s4,
     )
 
     if weight_scale is not None:

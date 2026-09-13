@@ -25,3 +25,7 @@ venv/
 
 # setuptools_scm generated
 humming/_version.py
+
+# Agent instruction files -- local-only, never committed
+/AGENTS.md
+/CLAUDE.md

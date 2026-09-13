@@ -61,6 +61,8 @@ struct KernelContext : LayerConfig_, ComputeConfig_, TuningConfig_ {
   static constexpr bool kUsePackedKLayout = LayerConfig::kUsePackedKLayout;
   static constexpr uint32_t kPackedKFactor = kUsePackedKLayout ? 2 : 1;
 
+  static constexpr bool kUseLdmatrixS4 = LayerConfig::kUseLdmatrixS4;
+
   static constexpr uint32_t M_WARPS = BlockShape::M / WarpShape::M;
   static constexpr uint32_t N_WARPS = BlockShape::N / WarpShape::N;
   static constexpr uint32_t K_WARPS = BlockShape::K / WarpShape::K;

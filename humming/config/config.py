@@ -57,6 +57,10 @@ class LayerConfig(BaseHummingConfig):
     # packed-K layout (wgmma + 8-bit activation + even-bit weight only)
     use_packed_k_layout: bool | None = None
 
+    # resolved ldmatrix.s8.s4 layout selection; stored, not derived from
+    # can_use_ldmatrix_s4, so it stays tied to what was actually packed
+    use_ldmatrix_s4: bool | None = None
+
     _cpp_extra_names: ClassVar[tuple[str, ...]] = (
         "mma_type_id",
         "is_channel_weight_scale",
@@ -104,6 +108,24 @@ class LayerConfig(BaseHummingConfig):
             )
 
         return self.b_dtype in accepted_b_dtype
+
+    @property
+    def can_use_ldmatrix_s4(self):
+        """PTX ISA 9.4 (CUDA 13.4+) capability check: WGMMA, int8 activation,
+        symmetric uint4 weight, SM90. Capability only, not the resolved
+        selection -- see use_ldmatrix_s4."""
+        from humming.jit.runtime import KernelRuntime
+
+        cuda_version = _cuda_compiler_version(KernelRuntime._get_compiler())
+        assert self.sm_version is not None
+        return (
+            self.mma_type == MmaType.WGMMA
+            and self.a_dtype == dtypes.int8
+            and self.b_dtype == dtypes.uint4
+            and not self.has_zero_point
+            and self.sm_version == 90
+            and cuda_version >= (13, 4)
+        )
 
     @property
     def mxmma_supported(self):
@@ -305,6 +327,13 @@ class LayerConfig(BaseHummingConfig):
             assert self.a_dtype.num_bits == 8, "use_packed_k_layout requires 8-bit activation"
             assert self.b_dtype.num_bits % 2 == 0, "use_packed_k_layout requires even-bit weight"
             assert not self.use_fused_e8m0_scale, "packed_k_layout is incompatible with fused-e8m0"
+
+        if self.use_ldmatrix_s4 is None:
+            # unlike use_packed_k_layout above: can't see the tuning shape picked later
+            self.use_ldmatrix_s4 = False
+        elif self.use_ldmatrix_s4:
+            assert self.use_packed_k_layout, "use_ldmatrix_s4 requires use_packed_k_layout"
+            assert self.can_use_ldmatrix_s4, "use_ldmatrix_s4 forced on but not eligible"
 
         if type(self) is LayerConfig:
             self._config_str = self.to_str()

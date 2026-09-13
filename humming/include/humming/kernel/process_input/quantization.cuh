@@ -6,28 +6,6 @@
 #include <humming/utils/all.cuh>
 
 
-enum class ScaleMode : uint32_t {
-  Static = 0,
-  DynamicToken = 1,
-  DynamicGroup = 2,
-  DynamicGroupToken = 3,
-};
-
-
-enum class QuantizationPhase : uint32_t {
-  Fused = 0,
-  CollectAbsmax = 1,
-  Quantize = 2,
-};
-
-
-enum class GroupScaleLayout : uint32_t {
-  RowMajor = 0,
-  MMajor = 1,
-  MxPacked = 2,
-};
-
-
 template <uint32_t kBytes>
 CUDA_INLINE void store_packed(uint8_t *output, const uint8_t *packed, bool zero) {
   using StoreType = typename LoadTypeChooser<kBytes>::Type;
@@ -90,11 +68,12 @@ CUDA_INLINE ScaleStorage<ScaleType> encode_scale(float value) {
   if constexpr (std::is_same<ScaleType, Float32>::value) {
     return value;
   } else if constexpr (std::is_same<ScaleType, Float8E4M3>::value) {
-    return static_cast<__nv_fp8_e4m3>(value).__x;
+    auto encoded = static_cast<__nv_fp8_e4m3>(value);
+    if (static_cast<float>(encoded) < value && encoded.__x < 0x7Eu) ++encoded.__x;
+    return encoded.__x;
   } else if constexpr (std::is_same<ScaleType, M3BFloat16>::value) {
     uint32_t bits = __float_as_uint(value);
-    uint32_t retained_lsb = (bits >> 20) & 1u;
-    bits = (bits + 0x0007FFFFu + retained_lsb) & 0xFFF00000u;
+    bits = (bits + 0x000FFFFFu) & 0xFFF00000u;
     return static_cast<uint16_t>(bits >> 16);
   } else {
     uint32_t bits = __float_as_uint(value);
@@ -172,8 +151,7 @@ CUDA_INLINE float lane_absmax(const float *values) {
     partial[chain] = fabsf(values[chain]);
   PRAGMA_UNROLL
   for (uint32_t value = kChains; value < kValues; value++)
-    partial[value % kChains] = fmaxf(
-        partial[value % kChains], fabsf(values[value]));
+    partial[value % kChains] = fmaxf(partial[value % kChains], fabsf(values[value]));
   PRAGMA_UNROLL
   for (uint32_t step = kChains / 2; step > 0; step >>= 1)
     for (uint32_t chain = 0; chain < step; chain++)
@@ -299,7 +277,7 @@ CUDA_INLINE float token_group_scale_max(float group_scale, float *shared) {
 
 
 template <class TargetType>
-__host__ __device__ constexpr float target_maximum() {
+constexpr float target_maximum() {
   if constexpr (std::is_same<TargetType, Float8E3M4>::value)
     return 30.f;
   else if constexpr (std::is_same<TargetType, Float8E4M3>::value)
@@ -506,46 +484,43 @@ struct QuantGroupResult {
 };
 
 
-template <
-    class TargetType,
-    class ScaleType,
-    uint32_t kValuesPerLane,
-    uint32_t kScaleSize,
-    uint32_t kNumWarps,
-    uint32_t kWarpOffset,
-    bool kStaticScale,
-    ScaleMode kScaleMode,
-    QuantizationPhase kPhase = QuantizationPhase::Fused>
-CUDA_INLINE QuantGroupResult<TargetType, ScaleType, kValuesPerLane> quant_group(
+template <class Context, uint32_t kWarpOffset = 0>
+CUDA_INLINE auto quant_group(
     float *values,
     float *shared,
     float static_scale,
-    ScaleStorage<ScaleType> collected_scale = {}) {
+    ScaleStorage<typename Context::QuantScaleType> collected_scale = {}) {
+  using TargetType = typename Context::TargetType;
+  using ScaleType = typename Context::QuantScaleType;
+  constexpr uint32_t kValuesPerLane = Context::kValuesPerThread;
+  constexpr uint32_t kScaleSize = Context::kScaleSize;
+  constexpr uint32_t kNumWarps = Context::kNumWarps;
+  constexpr ProcessInputQuantizationPhase kPhase = Context::kPhase;
   static_assert(supported_scale_type<ScaleType>);
-  static_assert(kScaleMode == ScaleMode::DynamicGroup || std::is_same<ScaleType, Float32>::value);
-  static_assert(kPhase == QuantizationPhase::Fused || kScaleMode == ScaleMode::DynamicToken);
+  static_assert(Context::kDynamicGroupScale || std::is_same<ScaleType, Float32>::value);
+  static_assert(kPhase == ProcessInputQuantizationPhase::Fused || Context::kDynamicTokenMode);
 
   QuantGroupResult<TargetType, ScaleType, kValuesPerLane> result;
-  if constexpr (kStaticScale && kScaleMode != ScaleMode::DynamicGroup) {
+  if constexpr (Context::kStaticTensorScale && !Context::kDynamicGroupScale) {
     float static_multiplier = 1.f / static_scale;
     PRAGMA_UNROLL
     for (uint32_t value = 0; value < kValuesPerLane; value++)
       values[value] *= static_multiplier;
   }
 
-  if constexpr (kPhase == QuantizationPhase::Quantize) {
+  if constexpr (kPhase == ProcessInputQuantizationPhase::Quantize) {
     result.scale = collected_scale;
-  } else if constexpr (kScaleMode != ScaleMode::Static) {
+  } else if constexpr (Context::kDynamicScale) {
     float maximum = group_absmax<kValuesPerLane, kScaleSize, kNumWarps, kWarpOffset>(values, shared);
     float raw_scale = fmaxf(maximum / target_maximum<TargetType>(), 1e-30f);
-    if constexpr (kStaticScale && kScaleMode == ScaleMode::DynamicGroup)
+    if constexpr (Context::kStaticTensorScale && Context::kDynamicGroupScale)
       raw_scale /= static_scale;
     result.scale = encode_scale<ScaleType>(raw_scale);
   }
 
-  if constexpr (kScaleMode != ScaleMode::Static && kPhase != QuantizationPhase::CollectAbsmax) {
+  if constexpr (Context::kDynamicScale && kPhase != ProcessInputQuantizationPhase::CollectAbsmax) {
     float scale = decode_scale<ScaleType>(result.scale);
-    if constexpr (kStaticScale && kScaleMode == ScaleMode::DynamicGroup)
+    if constexpr (Context::kStaticTensorScale && Context::kDynamicGroupScale)
       scale *= static_scale;
     float dynamic_multiplier;
     if constexpr (
@@ -560,7 +535,7 @@ CUDA_INLINE QuantGroupResult<TargetType, ScaleType, kValuesPerLane> quant_group(
       values[value] *= dynamic_multiplier;
   }
 
-  if constexpr (kPhase != QuantizationPhase::CollectAbsmax) {
+  if constexpr (kPhase != ProcessInputQuantizationPhase::CollectAbsmax) {
     if constexpr (TargetType::kIsFloatingPointType) {
       pack_float<TargetType, kValuesPerLane>(values, result.packed);
     } else if constexpr (TargetType::kBits == 8) {

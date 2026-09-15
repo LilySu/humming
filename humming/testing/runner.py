@@ -2,7 +2,7 @@ import dataclasses
 import json
 import os
 from collections import Counter
-from datetime import UTC, datetime
+from datetime import datetime, timezone
 from pathlib import Path
 
 import torch
@@ -360,7 +360,9 @@ class KernelTestRunner:
             values = inputs.matmul(weight.T)
         else:
             previous = torch.backends.cuda.matmul.allow_fp16_accumulation
-            torch.backends.cuda.matmul.allow_fp16_accumulation = True
+            # PPU's FP16-accumulation BLAS path returns zeros for GEMV (M=1).
+            # Keep half inputs, but use its working FP32 accumulation reference.
+            torch.backends.cuda.matmul.allow_fp16_accumulation = not current_device.is_ppu
             try:
                 values = inputs.half().matmul(weight.half().T)
             finally:
@@ -571,7 +573,7 @@ class KernelTestRunner:
         path = Path(log_path).expanduser().resolve()
         path.parent.mkdir(parents=True, exist_ok=True)
         record = {
-            "timestamp": datetime.now(UTC).isoformat(),
+            "timestamp": datetime.now(timezone.utc).isoformat(),
             "pytest_test": os.environ.get("PYTEST_CURRENT_TEST"),
             "test_case": dataclasses.asdict(self.test_case),
             "shape_m": shape_m,

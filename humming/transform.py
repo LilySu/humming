@@ -311,6 +311,15 @@ def transform_humming_weight(
         assert not use_fused_e8m0_scale, "use_packed_k_layout is incompatible with fused-e8m0 scale"
 
     if use_ldmatrix_s4:
+        if is_moe or weight.ndim != 3 or not weight.is_contiguous():
+            raise ValueError("ldmatrix.s8.s4 requires contiguous dense NK weights")
+        if (
+            b_dtype != dtypes.uint4
+            or a_dtype != dtypes.int8
+            or not packed
+            or (zero_point is not None and zero_point.numel())
+        ):
+            raise ValueError("ldmatrix.s8.s4 requires symmetric packed uint4/int8 without zero points")
         assert use_packed_k_layout, "use_ldmatrix_s4 requires use_packed_k_layout"
         assert not should_preprocess_with_zp, "use_ldmatrix_s4 (v1) requires a symmetric weight"
 

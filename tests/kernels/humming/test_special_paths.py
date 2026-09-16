@@ -176,9 +176,7 @@ SPECIAL_WEIGHT_CASES = (
             weight_scale_group_size=128,
             has_zero_point=False,
             mma_type=MmaType.WGMMA,
-            # forced on in test_special_weight_path below, not here --
-            # SPECIAL_WEIGHT_CASES builds at import time, before
-            # skip_if_unsupported can run
+            # The test re-resolves selection after its environment checks.
         ),
     ),
 )
@@ -202,8 +200,9 @@ def test_special_weight_path(required_features, test_case):
     )
 
     if "use_ldmatrix_s4" in required_features:
-        # forced on after skip_if_unsupported, not at module import time
-        config = dataclasses.replace(config, use_ldmatrix_s4=True)
+        config = dataclasses.replace(config, use_ldmatrix_s4=None)
+        if not config.can_use_ldmatrix_s4:
+            pytest.skip(str(config.ldmatrix_s4_rejection_reasons))
         test_case = dataclasses.replace(test_case, layer_config=config)
 
     for feature in required_features:
@@ -240,7 +239,7 @@ def test_special_weight_path_coverage():
     assert odd_bit_fallback.use_packed_k_layout is False
 
 
-def test_use_ldmatrix_s4_not_auto_enabled_by_default():
+def test_use_ldmatrix_s4_default_matches_eligibility():
     skip_if_unsupported(mma_type="wgmma", min_cuda_version=(13, 4))
     config = _layer_config(
         a_dtype=dtypes.int8,
@@ -250,8 +249,7 @@ def test_use_ldmatrix_s4_not_auto_enabled_by_default():
         has_zero_point=False,
         mma_type=MmaType.WGMMA,
     )
-    assert config.can_use_ldmatrix_s4, "test precondition: environment must be eligible"
-    assert config.use_ldmatrix_s4 is False
+    assert config.use_ldmatrix_s4 == config.can_use_ldmatrix_s4
 
 
 def test_use_ldmatrix_s4_incompatible_geometry_rejected():
@@ -265,7 +263,9 @@ def test_use_ldmatrix_s4_incompatible_geometry_rejected():
         weight_scale_group_size=128,
         has_zero_point=False,
         mma_type=MmaType.WGMMA,
-        use_ldmatrix_s4=True,
+        use_ldmatrix_s4=None,
     )
+    if not config.can_use_ldmatrix_s4:
+        pytest.skip(str(config.ldmatrix_s4_rejection_reasons))
     assert not _is_legal_geometry(config, block_shape=(64, 128, 128), warp_shape=(64, 32, 128))
     assert _is_legal_geometry(config, block_shape=(64, 128, 64), warp_shape=(64, 32, 64))

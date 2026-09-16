@@ -8,6 +8,12 @@ import torch
 from humming import dtypes
 from humming.config.base import BaseHummingConfig
 from humming.config.enum import GemmType, InputQuantizationMode, MmaType, WeightScale2Type, WeightScaleType
+from humming.config.ldmatrix_s4 import (
+    LEGACY_LAYOUT,
+    NEW_LAYOUT,
+    layer_rejection_reasons,
+    toolchain_rejection_reasons,
+)
 from humming.device import DeviceInfo, current_device
 from humming.utils.math import round_up
 
@@ -60,6 +66,7 @@ class LayerConfig(BaseHummingConfig):
     # resolved ldmatrix.s8.s4 layout selection; stored, not derived from
     # can_use_ldmatrix_s4, so it stays tied to what was actually packed
     use_ldmatrix_s4: bool | None = None
+    test_force_packed_k_legacy: bool = False
 
     _cpp_extra_names: ClassVar[tuple[str, ...]] = (
         "mma_type_id",
@@ -110,22 +117,26 @@ class LayerConfig(BaseHummingConfig):
         return self.b_dtype in accepted_b_dtype
 
     @property
-    def can_use_ldmatrix_s4(self):
-        """PTX ISA 9.4 (CUDA 13.4+) capability check: WGMMA, int8 activation,
-        symmetric uint4 weight, SM90. Capability only, not the resolved
-        selection -- see use_ldmatrix_s4."""
+    def ldmatrix_s4_rejection_reasons(self):
+        import json
+
         from humming.jit.runtime import KernelRuntime
 
-        cuda_version = _cuda_compiler_version(KernelRuntime._get_compiler())
-        assert self.sm_version is not None
-        return (
-            self.mma_type == MmaType.WGMMA
-            and self.a_dtype == dtypes.int8
-            and self.b_dtype == dtypes.uint4
-            and not self.has_zero_point
-            and self.sm_version == 90
-            and cuda_version >= (13, 4)
-        )
+        reasons = layer_rejection_reasons(json.loads(LayerConfig.to_str(self)))
+        if reasons:
+            return reasons
+        compiler = KernelRuntime._get_compiler()
+        return toolchain_rejection_reasons(compiler.__name__, _cuda_compiler_version(compiler))
+
+    @property
+    def can_use_ldmatrix_s4(self):
+        return not self.ldmatrix_s4_rejection_reasons
+
+    @property
+    def b_layout_identity(self):
+        if self.use_ldmatrix_s4:
+            return NEW_LAYOUT
+        return LEGACY_LAYOUT if self.use_packed_k_layout else "generic_repack"
 
     @property
     def mxmma_supported(self):
@@ -328,12 +339,14 @@ class LayerConfig(BaseHummingConfig):
             assert self.b_dtype.num_bits % 2 == 0, "use_packed_k_layout requires even-bit weight"
             assert not self.use_fused_e8m0_scale, "packed_k_layout is incompatible with fused-e8m0"
 
-        if self.use_ldmatrix_s4 is None:
-            # unlike use_packed_k_layout above: can't see the tuning shape picked later
+        if self.test_force_packed_k_legacy:
             self.use_ldmatrix_s4 = False
-        elif self.use_ldmatrix_s4:
-            assert self.use_packed_k_layout, "use_ldmatrix_s4 requires use_packed_k_layout"
-            assert self.can_use_ldmatrix_s4, "use_ldmatrix_s4 forced on but not eligible"
+        elif self.use_ldmatrix_s4 is None:
+            # Select the physical storage contract here. HummingKernel validates
+            # the actual chosen tuning before selecting/compiling its loader.
+            self.use_ldmatrix_s4 = self.can_use_ldmatrix_s4
+        elif self.use_ldmatrix_s4 and not self.can_use_ldmatrix_s4:
+            raise ValueError(f"ldmatrix.s8.s4 is ineligible: {self.ldmatrix_s4_rejection_reasons}")
 
         if type(self) is LayerConfig:
             self._config_str = self.to_str()

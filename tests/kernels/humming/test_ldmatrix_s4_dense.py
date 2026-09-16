@@ -100,18 +100,32 @@ def test_compact_batch_and_alternation_stability():
     target = input_data(8, 4096)
     surrounding = input_data(16, 4096, seed=1)
     other = input_data(8, 4096, seed=2)
+    # Compare loaders under one shared tuning resolved from the automatic
+    # ldmatrix config, which forces use_stream_k=False (_apply_ldmatrix_s4_contract).
+    # Without a shared tuning the forced-legacy arm's default heuristic selects
+    # Stream-K for this M=8/N=4096/K=4096 shape and fails check_tensor_locks; this
+    # test compares loader/repack stability, not Stream-K support (same shared-tuning
+    # pattern as test_dense_production_parity).
+    auto_config = make_config(4096, 4096)
+
+    def tuning_for(rows):
+        return get_heuristics_config(auto_config, shape_m=rows, gemm_type="dense")
+
     baseline = PreparedDense.create(make_config(4096, 4096, legacy=True), data, reference)
-    legacy_outputs = {0: baseline.run(target)[0], 1: baseline.run(other)[0]}
+    legacy_outputs = {
+        0: baseline.run(target, tuning=tuning_for(8))[0],
+        1: baseline.run(other, tuning=tuning_for(8))[0],
+    }
     for legacy in (False, True):
         prepared = PreparedDense.create(make_config(4096, 4096, legacy=legacy), data, reference)
-        alone, kernel = prepared.run(target)
+        alone, kernel = prepared.run(target, tuning=tuning_for(8))
         assert_output(alone, prepared.oracle(target), kernel)
         for batch, start in ((torch.cat((target, surrounding)), 0), (torch.cat((surrounding, target)), 16)):
-            output, _ = prepared.run(batch)
+            output, _ = prepared.run(batch, tuning=tuning_for(batch.shape[0]))
             torch.testing.assert_close(output[start : start + 8], alone, rtol=0.01, atol=0.05)
         for index in range(12):
             inputs = target if index % 2 == 0 else other
-            output, kernel = prepared.run(inputs)
+            output, kernel = prepared.run(inputs, tuning=tuning_for(inputs.shape[0]))
             assert_output(output, prepared.oracle(inputs), kernel)
         report = compare_outputs(
             output,

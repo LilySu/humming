@@ -75,6 +75,32 @@ def specialization_rejection_reasons(
     return tuple(reason for passed, reason in checks if not passed)
 
 
+def forced_tuning(block_m_seed: int, shape_n: int) -> dict[str, Any]:
+    """The single dense tuning family a prepared signed-s4 layer must run on.
+
+    Pure/CUDA-free so the production forcing (humming.tune._apply_ldmatrix_s4_contract)
+    and the CPU contract test share one definition. specialization_rejection_reasons
+    must accept exactly what this emits for any layer-eligible shape.
+    """
+    block_m = min(128, (block_m_seed + 15) // 16 * 16)
+    block_n = 256 if shape_n % 256 == 0 else 128
+    return {
+        "block_shape": (block_m, block_n, 64),
+        "warp_shape": (block_m, block_n // 4, 64),
+        "use_tma": True,
+        "use_tma_b": True,
+        "use_warp_spec": True,
+        "use_mbarrier": True,
+        "use_stream_k": False,
+        "use_f16_accum": False,
+        "use_pdl": False,
+        "num_stages": 3,
+        "multi_cast_size_a": 1,
+        "multi_cast_size_b": 1,
+        "reduce_overlap_last_stage_only": False,
+    }
+
+
 def assert_layout_compatible(prepared: str, required: str) -> None:
     if prepared != required:
         raise ValueError(f"prepared B layout {prepared} does not match loader layout {required}")

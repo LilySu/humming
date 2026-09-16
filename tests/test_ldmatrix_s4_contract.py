@@ -174,33 +174,38 @@ def test_auto_dense_eligibility_has_satisfiable_specialization():
     # to dense use_ldmatrix_s4=True must have at least one tuning for which
     # specialization_rejection_reasons() == () and the resolved loader is the
     # new loader, so an eligible layer is never repacked new-only with no valid
-    # specialization. Uses the real pure resolver, not a reimplementation. The
-    # forced-tuning geometry (block_n from shape_n, K=64, 3-stage TMA family) is
-    # what humming.tune._apply_ldmatrix_s4_contract emits; the full
+    # specialization. The tuning family comes from the SHARED pure helper
+    # forced_tuning() that production humming.tune._apply_ldmatrix_s4_contract
+    # also calls, so this fails if the real forcing logic changes to emit an
+    # incompatible block_n/K/warp/staging/schedule family. The full
     # heuristic->resolve linkage is exercised by the GPU dense tests.
     resolve = contract["resolve_specialization_loader"]
+    forced_tuning = contract["forced_tuning"]
     new_loader = contract["NEW_LOADER"]
     legacy_loader = contract["LEGACY_LOADER"]
 
-    def contract_tuning(shape_n):
-        block_n = 256 if shape_n % 256 == 0 else 128
-        return TUNING | {"block_shape": (128, block_n, 64), "warp_shape": (128, block_n // 4, 64)}
+    def selected_tuning(shape_n, block_m_seed=128):
+        # gemm_type is the dense-execution requirement, not a tuning-family
+        # parameter; everything else is exactly what the production helper emits.
+        return {"gemm_type": "dense"} | forced_tuning(block_m_seed, shape_n)
 
     # Every supported automatic dense shape family (both block_n branches plus a
-    # model-real shape) is layer-eligible AND has a satisfiable specialization
-    # that resolves to the new loader.
+    # model-real shape), across the range of block_m seeds the heuristic can feed
+    # the forcing helper, is layer-eligible AND resolves to the new loader with an
+    # empty specialization rejection.
     for shape_n, shape_k in ((128, 128), (256, 256), (384, 128), (4096, 4096)):
         layer = BASE | {"shape_n": shape_n, "shape_k": shape_k, "use_ldmatrix_s4": True}
         assert layer_reasons(layer) == ()
-        tuning = contract_tuning(shape_n)
-        assert specialization_reasons(tuning, shape_n) == ()
-        assert resolve(layer, tuning, ()) == (new_loader, ())
+        for block_m_seed in (16, 96, 128, 200):
+            tuning = selected_tuning(shape_n, block_m_seed)
+            assert specialization_reasons(tuning, shape_n) == ()
+            assert resolve(layer, tuning, ()) == (new_loader, ())
 
     # Layer-capable but the selected tuning is incompatible: resolution must
     # reject (raise), never silently keep the prepared new layout without a
     # satisfiable specialization.
     eligible = BASE | {"use_ldmatrix_s4": True}
-    incompatible = contract_tuning(128) | {"num_stages": 4}
+    incompatible = selected_tuning(128) | {"num_stages": 4}
     assert specialization_reasons(incompatible, 128)  # non-empty
     with pytest.raises(ValueError, match="cannot use specialization"):
         resolve(eligible, incompatible, ())
@@ -208,7 +213,7 @@ def test_auto_dense_eligibility_has_satisfiable_specialization():
     # Test-force-legacy selects the legacy loader and does not mutate the
     # underlying layer capability/eligibility result.
     forced = BASE | {"use_ldmatrix_s4": False, "test_force_packed_k_legacy": True}
-    loader, reasons = resolve(forced, contract_tuning(128), ())
+    loader, reasons = resolve(forced, selected_tuning(128), ())
     assert loader == legacy_loader
     assert "test_force_legacy" in reasons
     assert layer_reasons(BASE) == ()  # capability predicate unaffected by force-legacy

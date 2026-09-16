@@ -245,7 +245,10 @@ def test_selection_metadata(mode):
         ("fp4", {"b_dtype": dtypes.float4e2m1}),
         ("fp8", {"b_dtype": dtypes.float8e4m3}),
         ("int8", {"b_dtype": dtypes.int8}),
-        ("wna16", {"a_dtype": dtypes.bfloat16, "use_packed_k_layout": False}),
+        # input_quant_mode=None lets LayerConfig re-resolve to Disabled for the
+        # 16-bit activation (int8's dynamic-token mode would violate the
+        # has_input_scale invariant), yielding a valid ineligible A16 config.
+        ("wna16", {"a_dtype": dtypes.bfloat16, "use_packed_k_layout": False, "input_quant_mode": None}),
         ("preprocess", {"use_int_weight_scale": True, "weight_scale_group_size_n": 1}),
     ],
 )

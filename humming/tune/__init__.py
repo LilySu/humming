@@ -3,6 +3,7 @@ import functools
 import torch
 
 from humming.config import GemmType, LayerConfig
+from humming.config.ldmatrix_s4 import forced_tuning
 from humming.device import DeviceInfo, get_device_index
 from humming.tune.base import DeviceHeuristics
 from humming.tune.raster import raster_group_m_for_config
@@ -90,23 +91,7 @@ def _apply_ldmatrix_s4_contract(config: dict, layer_config, gemm_type) -> None:
         return
     if gemm_type != GemmType.DENSE:
         raise ValueError("ldmatrix.s8.s4 prepared weights require dense execution")
-    block_m = min(128, (config["block_shape"][0] + 15) // 16 * 16)
-    block_n = 256 if layer_config.shape_n % 256 == 0 else 128
-    config.update(
-        block_shape=(block_m, block_n, 64),
-        warp_shape=(block_m, block_n // 4, 64),
-        use_tma=True,
-        use_tma_b=True,
-        use_warp_spec=True,
-        use_mbarrier=True,
-        use_stream_k=False,
-        use_f16_accum=False,
-        use_pdl=False,
-        num_stages=3,
-        multi_cast_size_a=1,
-        multi_cast_size_b=1,
-        reduce_overlap_last_stage_only=False,
-    )
+    config.update(forced_tuning(config["block_shape"][0], layer_config.shape_n))
 
 
 @functools.lru_cache(maxsize=1024)

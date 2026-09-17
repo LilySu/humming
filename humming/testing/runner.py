@@ -2,7 +2,7 @@ import dataclasses
 import json
 import os
 from collections import Counter
-from datetime import UTC, datetime
+from datetime import datetime, timezone
 from pathlib import Path
 
 import torch
@@ -10,7 +10,7 @@ from filelock import FileLock
 
 import humming.utils.jit as jit_utils
 from humming import dtypes, ops
-from humming.config import ComputeConfig, GemmType, InputQuantizationMode, LayerConfig, MmaType, TuningConfig
+from humming.config import ComputeConfig, GemmType, LayerConfig, MmaType, TuningConfig
 from humming.device import current_device
 from humming.kernel.humming import HummingKernel
 from humming.schema import HummingWeightSchema
@@ -76,9 +76,7 @@ class KernelTestCase:
 
     @property
     def uses_m_major_input_scale(self) -> bool:
-        return self.compute_config.use_m_major_input_scale or (
-            self.layer_config.is_token_input_scale and self.layer_config.mma_type != MmaType.MXMMA
-        )
+        return self.compute_config.use_m_major_input_scale
 
 
 @dataclasses.dataclass(frozen=True, kw_only=True)
@@ -194,6 +192,7 @@ class KernelTestRunner:
     def prepare_inputs(
         self,
         inputs_orig: torch.Tensor,
+        static_scale: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor | None, torch.Tensor | None]:
         config = self.layer_config
         shape_k = config.shape_k - config.pad_shape_k
@@ -203,51 +202,33 @@ class KernelTestRunner:
             inputs = inputs_orig.to(dtypes.torch_dtype_map[config.a_dtype])
             return inputs.float(), inputs, None, None
 
-        static_scale = None
-        if config.input_quant_mode.has_static_tensor_scale:
+        if config.input_quant_mode.has_tensor_scale and static_scale is None:
             target_maximum = 448.0 if config.a_dtype == dtypes.float8e4m3 else 127.0
             static_scale = (inputs_orig.abs().amax() / target_maximum).reshape(1).float()
 
         def process(m_major_scale: bool = False):
-            scale_layout = "row_major"
-            if m_major_scale and config.input_scale_group_size > 0:
-                scale_layout = "m_major"
-                if str(config.as_dtype) in ("float8e4m3", "float8e8m0"):
-                    scale_layout = "mx_packed"
             result = ops.process_input(
                 inputs_orig,
                 quant_mode=config.input_quant_mode.value,
                 quant_dtype=str(config.a_dtype),
                 quant_group_size=config.input_scale_group_size or None,
                 group_scale_dtype=str(config.as_dtype),
-                group_scale_layout=scale_layout,
+                use_m_major_input_scale=m_major_scale,
                 token_scales=static_scale,
             )
             return result
 
         inputs, group_scale_ref, token_scale_ref = process()
-        use_m_major_input_layout = self.test_case.uses_m_major_input_scale and (
-            config.input_scale_group_size > 0 or config.mma_type == MmaType.MXMMA
-        )
+        use_m_major_input_layout = self.test_case.uses_m_major_input_scale
         if use_m_major_input_layout:
-            _, input_scale, input_scale_2 = process(m_major_scale=True)
-            if config.mma_type == MmaType.MXMMA and input_scale is not None:
-                input_scale = input_scale.view(torch.int32)
-                if input_scale.ndim == 3:
-                    input_scale = input_scale.reshape(input_scale.size(0), input_scale.size(1))
-        elif config.mma_type == MmaType.MXMMA and config.input_scale_group_size > 0:
-            assert group_scale_ref is not None
-            input_scale = group_scale_ref.view(torch.int32).contiguous()
-            input_scale_2 = token_scale_ref
+            _, major_groups, major_tokens = process(m_major_scale=True)
+            input_scale = major_groups if config.input_quant_mode.has_group_scale else major_tokens
+            input_scale_2 = major_tokens if config.input_quant_mode.has_secondary_scale else None
         else:
             input_scale = group_scale_ref if group_scale_ref is not None else token_scale_ref
             input_scale_2 = token_scale_ref if config.input_quant_mode.has_secondary_scale else None
 
-        if config.input_quant_mode.has_dynamic_token_scale and input_scale_2 is not None:
-            input_scale_2 = input_scale_2.unsqueeze(-1)
-        if config.input_quant_mode == InputQuantizationMode.DynamicToken and input_scale is not None:
-            input_scale = input_scale.unsqueeze(-1)
-        if config.input_quant_mode.has_static_tensor_scale:
+        if config.input_quant_mode.has_tensor_scale:
             tensor_scale = static_scale
             if config.input_quant_mode.has_secondary_scale:
                 input_scale_2 = tensor_scale
@@ -275,7 +256,8 @@ class KernelTestRunner:
             dequant_inputs = inputs.float()
 
         if group_scale_ref is not None:
-            scale_ref = group_scale_ref.float()
+            scale_ref = group_scale_ref.view(dtypes.torch_dtype_map[config.as_dtype])
+            scale_ref = scale_ref[:, : shape_k // config.input_scale_group_size].float()
             if token_scale_ref is not None:
                 scale_ref = scale_ref * token_scale_ref.float().reshape(-1, 1)
             group_size = config.input_scale_group_size
@@ -378,7 +360,9 @@ class KernelTestRunner:
             values = inputs.matmul(weight.T)
         else:
             previous = torch.backends.cuda.matmul.allow_fp16_accumulation
-            torch.backends.cuda.matmul.allow_fp16_accumulation = True
+            # PPU's FP16-accumulation BLAS path returns zeros for GEMV (M=1).
+            # Keep half inputs, but use its working FP32 accumulation reference.
+            torch.backends.cuda.matmul.allow_fp16_accumulation = not current_device.is_ppu
             try:
                 values = inputs.half().matmul(weight.half().T)
             finally:
@@ -470,6 +454,10 @@ class KernelTestRunner:
             )
         except AssertionError as error:
             self._record_numerical_error(error, shape_m, tuning_values, tuning_index)
+            raise AssertionError(
+                f"kernel result mismatch for shape_m={shape_m}, "
+                f"tuning_index={tuning_index}, tuning_config={tuning_values}"
+            ) from error
         except Exception as error:
             raise RuntimeError(
                 f"kernel result check failed for shape_m={shape_m}, "
@@ -506,6 +494,10 @@ class KernelTestRunner:
             group_size=self.layer_config.input_scale_group_size,
             device=self.device,
         )
+        static_scale = None
+        if self.layer_config.input_quant_mode.has_tensor_scale:
+            target_maximum = 448.0 if self.layer_config.a_dtype == dtypes.float8e4m3 else 127.0
+            static_scale = (base_inputs.abs().amax() / target_maximum).reshape(1).float()
         base_topk_ids = None
         if self.compute_config.gemm_type != GemmType.DENSE:
             num_experts, top_k = self.layer_config.num_experts, self.test_case.top_k
@@ -517,7 +509,7 @@ class KernelTestRunner:
             block_shape_m = max_kernel[1]["block_shape"][0]
             base_problem = self._prepare_problem(max_shape_m, base_inputs, base_topk_ids, block_shape_m)
             base_problem_inputs, base_launch_tensors, base_output_ids = base_problem
-            _, inputs, input_scale, input_scale_2 = self.prepare_inputs(base_problem_inputs)
+            _, inputs, input_scale, input_scale_2 = self.prepare_inputs(base_problem_inputs, static_scale)
             base_launch_tensors |= {
                 "inputs": inputs,
                 "input_scale": input_scale,
@@ -535,7 +527,7 @@ class KernelTestRunner:
             moe_block_size = test_kernel[1]["block_shape"][0]
             problem = self._prepare_problem(shape_m, inputs, topk_ids, moe_block_size)
             problem_inputs, launch_tensors, output_ids = problem
-            inputs_ref, inputs, input_scale, input_scale_2 = self.prepare_inputs(problem_inputs)
+            inputs_ref, inputs, input_scale, input_scale_2 = self.prepare_inputs(problem_inputs, static_scale)
             launch_tensors |= {
                 "inputs": inputs,
                 "input_scale": input_scale,
@@ -581,7 +573,7 @@ class KernelTestRunner:
         path = Path(log_path).expanduser().resolve()
         path.parent.mkdir(parents=True, exist_ok=True)
         record = {
-            "timestamp": datetime.now(UTC).isoformat(),
+            "timestamp": datetime.now(timezone.utc).isoformat(),
             "pytest_test": os.environ.get("PYTEST_CURRENT_TEST"),
             "test_case": dataclasses.asdict(self.test_case),
             "shape_m": shape_m,

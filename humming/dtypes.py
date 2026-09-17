@@ -10,6 +10,8 @@ class DataType:
     is_signed: bool = True
     is_integer_type: bool = False
     is_floating_point_type: bool = False
+    exponent_bits: int = 0
+    mantissa_bits: int = 0
 
     def __post_init__(self):
         assert self.__class__ is not DataType
@@ -34,6 +36,17 @@ class DataType:
             return IntegerType.from_torch_dtype(torch_dtype)
         else:
             raise NotImplementedError
+
+    @classmethod
+    def from_any(cls, dtype):
+        if isinstance(dtype, DataType):
+            return dtype
+        elif isinstance(dtype, str):
+            return cls.from_str(dtype)
+        elif isinstance(dtype, torch.dtype):
+            return cls.from_torch_dtype(dtype)
+        else:
+            raise ValueError(f"unsupported dtype: {dtype}")
 
     def to_str(self):
         raise NotImplementedError

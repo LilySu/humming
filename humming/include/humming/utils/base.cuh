@@ -3,6 +3,9 @@
 #include <cuda.h>
 
 
+#ifndef USE_PPU
+  #define USE_PPU 0
+#endif
 #define MAX(a, b) ((a) > (b) ? (a) : (b))
 #define MIN(a, b) ((a) < (b) ? (a) : (b))
 #define CEIL_DIV(a, b) ((a + b - 1) / (b))
@@ -77,6 +80,15 @@ constexpr uint32_t get_max_load_bytes(uint32_t bytes) {
   if (bytes % 4 == 0) return 4;
   if (bytes % 2 == 0) return 2;
   return 1;
+}
+
+constexpr uint32_t constexpr_log2(uint32_t value) {
+  uint32_t result = 0;
+  while (value > 1) {
+    value >>= 1;
+    result++;
+  }
+  return result;
 }
 
 template <int bytes>

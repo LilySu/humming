@@ -104,6 +104,9 @@ inline int64_t get_num_sms(int64_t num_sms, int64_t dev) {
   CUdevice device;
   int32_t dev_sms;
   check_curesult(cuDeviceGet(&device, dev), "cuDeviceGet");
+  char device_name[256];
+  check_curesult(cuDeviceGetName(device_name, sizeof(device_name), device), "cuDeviceGetName");
+  if (std::string(device_name).find("ZW810E") != std::string::npos) return 20;
   check_curesult(
       cuDeviceGetAttribute(&dev_sms, CU_DEVICE_ATTRIBUTE_MULTIPROCESSOR_COUNT, device),
       "cuDeviceGetAttribute");
@@ -434,11 +437,11 @@ COMMON_TORCH_LIBRARY(humming, m) {
   m.def("get_kernel_loader_variant(int kernel_id) -> str");
   m.def(
       "launch_process_input(Tensor configs, Tensor inputs, Tensor(a!) outputs, "
-      "Tensor(b!)? group_scales, Tensor(c!)? token_scales, Tensor? expert_layout, "
-      "Tensor? indices) -> ()");
+      "Tensor(b!)? group_scales, Tensor(c!)? token_scales, Tensor? expert_tokens, "
+      "Tensor? scatter_idx, Tensor? num_valid_tokens) -> ()");
   m.def(
       "launch_process_input.inplace(Tensor configs, Tensor(a!) inputs, "
-      "Tensor? expert_layout, Tensor? indices) -> ()");
+      "Tensor? expert_tokens, Tensor? scatter_idx, Tensor? num_valid_tokens) -> ()");
 };
 
 COMMON_TORCH_LIBRARY_IMPL(humming, CUDA, m) {

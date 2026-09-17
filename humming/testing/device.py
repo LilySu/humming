@@ -16,12 +16,6 @@ _A_DTYPE_MIN_SM = {
 }
 
 
-def _coerce_dtype(value):
-    if value is None or isinstance(value, dtypes.DataType):
-        return value
-    return dtypes.DataType.from_str(value)
-
-
 def skip_if_unsupported(
     a_dtype=None,
     mma_type=None,
@@ -54,13 +48,25 @@ def skip_if_unsupported(
     if mma_type == "mxmma" and sm // 10 != 12:
         pytest.skip(f"mxmma requires SM12x, current SM is {sm}")
 
-    a_dtype = _coerce_dtype(a_dtype)
+    a_dtype = a_dtype and dtypes.DataType.from_any(a_dtype)
     if mma_type == "wgmma" and a_dtype == dtypes.int4:
         pytest.skip("wgmma does not support int4 activation")
+
+    if sm == 121 and mma_type == "mxmma" and a_dtype == dtypes.float4e0m3:
+        from humming.config.config import _cuda_compiler_version
+        from humming.jit.runtime import KernelRuntime
+
+        compiler_version = _cuda_compiler_version(KernelRuntime._get_compiler())
+        if compiler_version < (13, 1):
+            pytest.skip("E0M3 MXMMA on SM121 requires CUDA 13.1 or newer (PTX ISA 9.1)")
+
     if a_dtype is not None and a_dtype in _A_DTYPE_MIN_SM:
         min_sm = _A_DTYPE_MIN_SM[a_dtype]
         if sm < min_sm:
             pytest.skip(f"a_dtype {a_dtype} requires SM>={min_sm}, current SM is {sm}")
+
+    if current_device.is_ppu and a_dtype == dtypes.int4:
+        pytest.skip("PPU does not support int4 mma")
 
     if use_cp_async and sm < 80:
         pytest.skip(f"cp.async requires SM>=80, current SM is {sm}")

@@ -19,7 +19,7 @@ from humming.config import (
 )
 from humming.config.config import _cuda_compiler_version
 from humming.config.ldmatrix_s4 import resolve_specialization_loader
-from humming.device import get_device_index
+from humming.device import current_device, get_device_index
 from humming.jit.runtime import KernelRuntime
 from humming.tune import get_heuristics_config
 from humming.utils.smem import estimate_smem_size_config
@@ -275,6 +275,8 @@ class HummingKernel(KernelRuntime, LayerConfig, ComputeConfig, TuningConfig):
 
         mma_shape_m = self.warp_shape[0] if self.mma_type == MmaType.WGMMA else 16
         mma_shape_n = 64 if self.mma_type == MmaType.WGMMA else 8
+        if current_device.is_ppu:
+            mma_shape_n = 16
         mma_shape_k = 256 // self.a_dtype.num_bits
         if self.sm_version == 75:
             if self.a_dtype == dtypes.float16:
@@ -395,6 +397,10 @@ class HummingKernel(KernelRuntime, LayerConfig, ComputeConfig, TuningConfig):
         }
         assert self.a_dtype in dtype_map
         assert self.sm_version >= dtype_map[self.a_dtype]
+        if self.sm_version == 121 and self.mma_type == MmaType.MXMMA and self.a_dtype == dtypes.float4e0m3:
+            assert _cuda_compiler_version(self._get_compiler()) >= (13, 1), (
+                "E0M3 MXMMA on SM121 requires CUDA 13.1 or newer (PTX ISA 9.1)"
+            )
         assert self.b_dtype.num_bits <= 8
         assert self.b_dtype.num_bits <= self.a_dtype.num_bits
         if self.b_dtype.is_integer_type and self.a_dtype.is_integer_type:
@@ -417,10 +423,15 @@ class HummingKernel(KernelRuntime, LayerConfig, ComputeConfig, TuningConfig):
             assert self.use_fused_e8m0_scale
 
         if self.use_f16_accum:
+            allowed_f16_dtypes = [dtypes.float16]
+            if current_device.is_ppu:
+                allowed_f16_dtypes.append(dtypes.bfloat16)
+
             if self.a_dtype == dtypes.float8e4m3:
                 assert self.b_dtype.is_integer_type or self.b_dtype.exponent_bits <= 4
+                assert self.c_dtype in allowed_f16_dtypes
             else:
-                assert self.a_dtype == dtypes.float16
+                assert self.a_dtype in allowed_f16_dtypes
 
     def check_config(self):
         assert self.num_threads <= 1024
@@ -471,8 +482,7 @@ class HummingKernel(KernelRuntime, LayerConfig, ComputeConfig, TuningConfig):
         if self.is_tensor_input_scale:
             self.use_tma_as = False
             self.use_m_major_input_scale = False
-        elif self.has_input_scale and self.input_scale_group_size == 0 and self.mma_type != MmaType.MXMMA:
-            self.use_m_major_input_scale = True
+
         if self.mma_type == MmaType.MXMMA and self.input_scale_group_size == 0:
             self.use_tma_as = False
             self.use_m_major_input_scale = False

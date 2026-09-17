@@ -69,7 +69,7 @@ private:
 public:
   uint32_t as[2][kNumASPerGroup];
   uint32_t q_as[kNumASPerGroup];
-  uint32_t bs[2][MAX(kNumBSPerGroup, 8) * ElementBS::kBits / 32];
+  alignas(16) uint32_t bs[2][MAX(kNumBSPerGroup, 8) * ElementBS::kBits / 32];
   uint32_t dq_bs[MAX(kNumBSPerGroup, 8) * kDequantBSBits / 32];
   uint32_t zp[2][(kIsFpZeroPoint ? 4 : CEIL_DIV(ElementB::kBits, 4)) * kNumZPGroupsPerMma];
 
@@ -394,8 +394,9 @@ public:
 
     PRAGMA_UNROLL
     for (uint32_t index = 0; index < MmaShape::M * MmaShape::N / 64; index++) {
-      uint32_t inner_m = index % (MmaShape::M / 8);
-      uint32_t inner_n = index / (MmaShape::M / 8);
+      // PPU's accumulator fragments enumerate N before M.
+      uint32_t inner_m = USE_PPU ? index / (MmaShape::N / 8) : index % (MmaShape::M / 8);
+      uint32_t inner_n = USE_PPU ? index % (MmaShape::N / 8) : index / (MmaShape::M / 8);
 
       if constexpr (kIsF16Accum) {
         scalar_t2 &part_regs_c0 = reinterpret_cast<scalar_t2 *>(regs_c[0][m][n])[index];

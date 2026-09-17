@@ -100,12 +100,7 @@ def test_compact_batch_and_alternation_stability():
     target = input_data(8, 4096)
     surrounding = input_data(16, 4096, seed=1)
     other = input_data(8, 4096, seed=2)
-    # Compare loaders under one shared tuning resolved from the automatic
-    # ldmatrix config, which forces use_stream_k=False (_apply_ldmatrix_s4_contract).
-    # Without a shared tuning the forced-legacy arm's default heuristic selects
-    # Stream-K for this M=8/N=4096/K=4096 shape and fails check_tensor_locks; this
-    # test compares loader/repack stability, not Stream-K support (same shared-tuning
-    # pattern as test_dense_production_parity).
+    # Share automatic tuning to isolate loader/repack stability.
     auto_config = make_config(4096, 4096)
 
     def tuning_for(rows):

@@ -193,12 +193,8 @@ __global__ void weight_repack_nk(
     static_assert(kNumBitsA == 8, "ldmatrix.s8.s4 requires 8-bit activation");
     static_assert(!kShouldPreprocessForINT2FP, "ldmatrix.s8.s4 (v1) is int-only, not int->fp");
     static_assert(!kShouldPreprocessWithZP, "ldmatrix.s8.s4 (v1) requires a symmetric weight, no zero point");
-    // K-major, gapless layout for this CTA's 64(N) x 64(K) block: 64 rows x
-    // 32 bytes/row. Extracted straight from smem, bypassing tmp[]/
-    // humming_pack_weight's tile permutation and interleaved packing below,
-    // which this layout doesn't use. Stores code ^ 8: ldmatrix.s8.s4's
-    // hardware sign-extension turns that into code - 8 on load, matching
-    // the existing symmetric dequant convention with no separate dequant step.
+    // K-major, gapless 64(N) x 64(K) tile of packed signed 4-bit weights.
+    // `ldmatrix.s8.s4` sign-extends each nibble to INT8; symmetric weights only.
     uint32_t packed_out_stride = 64 * padded_shape_n * kNumBitsB / 32;
     uint32_t packed_max_row = gridDim.z * padded_shape_k / 64;
     uint32_t out_row = (blockIdx.y * 64 + blockIdx.z * padded_shape_k) / 64;

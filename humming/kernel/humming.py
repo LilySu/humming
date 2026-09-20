@@ -1,6 +1,5 @@
 import dataclasses
 import functools
-import hashlib
 import json
 from typing import ClassVar
 
@@ -133,8 +132,8 @@ class HummingKernel(KernelRuntime, LayerConfig, ComputeConfig, TuningConfig):
         self.check_dtype()
         self.check_scale()
         self.check_config()
-        # LayerConfig chooses storage; only the actual specialization can select a loader.
-        self.selected_loader_variant, self.loader_selection_reasons = resolve_specialization_loader(
+        # Raise if an explicit tuning can't run the prepared ldmatrix.s8.s4 layout.
+        resolve_specialization_loader(
             json.loads(LayerConfig.to_str(self)),
             json.loads(self.to_str()),
             self.ldmatrix_s4_rejection_reasons,
@@ -176,7 +175,6 @@ class HummingKernel(KernelRuntime, LayerConfig, ComputeConfig, TuningConfig):
             f"    TuningConfig>"
         )
 
-        self.specialization_identity = hashlib.sha256((self.code + self.kernel_expr).encode()).hexdigest()
         self.prepare()
         self.register_kernel()
 
@@ -185,10 +183,6 @@ class HummingKernel(KernelRuntime, LayerConfig, ComputeConfig, TuningConfig):
 
         kernel_filename = self.kernel_filename
         self.kernel_id, self.kernel_name = ops.register_kernel(kernel_filename)
-        actual_loader = torch.ops.humming.get_kernel_loader_variant(self.kernel_id)
-        if actual_loader != self.selected_loader_variant:
-            raise RuntimeError(f"compiled loader {actual_loader} differs from generated selection")
-        self.selected_loader_variant = actual_loader
         self._id2kernel[self.kernel_id] = self
 
     @property

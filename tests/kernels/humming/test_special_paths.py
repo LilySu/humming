@@ -1,7 +1,10 @@
 import pytest
+import torch
+from torch._dynamo.testing import CompileCounterWithBackend
 
 from humming import dtypes
 from humming.config import ComputeConfig, GemmType, LayerConfig, MmaType, WeightScale2Type
+from humming.forward import humming_forward
 from humming.testing import (
     KernelTestCase,
     KernelTestRunner,
@@ -164,6 +167,40 @@ SPECIAL_WEIGHT_CASES = (
         ),
     ),
 )
+
+
+def test_forward_fullgraph():
+    """Catch graph breaks in the forward path and reuse the graph across token counts."""
+    torch._dynamo.reset()
+    skip_if_unsupported(a_dtype=dtypes.bfloat16)
+    config = _layer_config(
+        a_dtype=dtypes.bfloat16,
+        b_dtype=dtypes.uint4,
+        bs_dtype=dtypes.bfloat16,
+    )
+    runner = KernelTestRunner(
+        KernelTestCase(name="fullgraph", layer_config=config, compute_config=ComputeConfig())
+    )
+    compute_config = runner.compute_config.to_str()
+    locks = torch.zeros(1024, device="cuda", dtype=torch.int32)
+
+    def forward(inputs):
+        return humming_forward(
+            config,
+            inputs,
+            **runner.kernel_tensors,
+            locks=locks,
+            compute_config=compute_config,
+            tuning_config={},
+        )
+
+    counter = CompileCounterWithBackend("inductor")
+    compiled = torch.compile(forward, backend=counter, fullgraph=True, dynamic=True)
+    for shape_m in (17, 257):
+        inputs = torch.randn(shape_m, SHAPE_K, device="cuda", dtype=torch.bfloat16)
+        expected = (inputs.float() @ runner.weight_ref.T).to(torch.bfloat16)
+        torch.testing.assert_close(compiled(inputs), expected, rtol=0.01, atol=0.05)
+    assert counter.frame_count == 1
 
 
 @pytest.mark.parametrize(

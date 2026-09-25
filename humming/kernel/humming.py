@@ -44,6 +44,7 @@ public:
 class LayerConfig {
 public:
 {{layer_config}}
+static constexpr bool kUseLdmatrixS4 = {{use_ldmatrix_s4}};
 };
 
 class ComputeConfig {
@@ -70,9 +71,9 @@ using SharedStorageType = SharedStorage<
 
 
 extern "C" __constant__ uint32_t SMEM_SIZE = sizeof(SharedStorageType);
-extern "C" __constant__ uint32_t SMEM_SIZE_A = 
+extern "C" __constant__ uint32_t SMEM_SIZE_A =
     SharedStorageType::kNumStages * SharedStorageType::kStageSizeA * sizeof(int4);
-extern "C" __constant__ uint32_t SMEM_SIZE_B = 
+extern "C" __constant__ uint32_t SMEM_SIZE_B =
     SharedStorageType::kNumStages * SharedStorageType::kStageSizeB * sizeof(int4);
 extern "C" __constant__ uint32_t SMEM_SIZE_REDUCE = sizeof(SharedStorageType::reduce);
 
@@ -127,6 +128,16 @@ class HummingKernel(KernelRuntime, LayerConfig, ComputeConfig, TuningConfig):
         self.check_dtype()
         self.check_scale()
         self.check_config()
+        compiler_version = _cuda_compiler_version(self._get_compiler())
+
+        use_ldmatrix_s4 = (
+            self.use_signed_s4_kmajor_layout
+            and self.sm_version == 90
+            and compiler_version >= (13, 4)
+            and self.block_shape[2] == 64
+            and self.warp_shape[2] == 64
+        )
+
         self.mma_op_class = self.select_mma_op_class()
 
         assert self.bs_dtype is not None
@@ -146,6 +157,7 @@ class HummingKernel(KernelRuntime, LayerConfig, ComputeConfig, TuningConfig):
             layer_config_macro=self.to_macro_cpp_str(LayerConfig),
             compute_config_macro=self.to_macro_cpp_str(ComputeConfig),
             tuning_config_macro=self.to_macro_cpp_str(TuningConfig),
+            use_ldmatrix_s4=int(use_ldmatrix_s4),
         )
         self.code = CODE_TEMPLATE.render(**template_args)
         self.kernel_expr = (

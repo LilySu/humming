@@ -166,6 +166,18 @@ SPECIAL_WEIGHT_CASES = (
             mma_type=MmaType.WGMMA,
         ),
     ),
+    _kernel_case(
+        required_features=("use_packed_k_layout",),
+        name="packed-k-w4a8",
+        layer_config=_layer_config(
+            a_dtype=dtypes.int8,
+            b_dtype=dtypes.uint4,
+            bs_dtype=dtypes.bfloat16,
+            weight_scale_group_size=128,
+            has_zero_point=False,
+            mma_type=MmaType.WGMMA,
+        ),
+    ),
 )
 
 
@@ -216,7 +228,6 @@ def test_special_weight_path(required_features, test_case):
     config = test_case.layer_config
     if "use_fused_e8m0_scale" in required_features and config.mma_type == MmaType.MXMMA:
         pytest.skip("fused E8M0 scale is not supported by MXMMA")
-
     for feature in required_features:
         assert getattr(config, feature) is True
     if "use_int_weight_scale" in required_features or "use_fused_e8m0_scale" in required_features:

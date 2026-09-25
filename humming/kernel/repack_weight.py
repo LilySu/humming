@@ -11,13 +11,13 @@ from humming.jit.runtime import KernelRuntime
 
 CODE_TEMPLATE = jinja2.Template("""
 #include <humming/kernel/process.cuh>
-
 """)
 
 
 @dataclasses.dataclass(kw_only=True)
 class RepackWeightKernel(KernelRuntime):
     name: ClassVar[str] = "weight_repack_nk"
+
     weight_bits: int
     activation_bits: int
     is_weight_packed: bool
@@ -28,12 +28,28 @@ class RepackWeightKernel(KernelRuntime):
     group_size_zp: int = 0
     use_packed_k_layout: bool = False
     use_native_dequant: bool = False
+    use_signed_s4_kmajor_layout: bool = False
 
     def init_kernel(self):
         if self.should_preprocess_with_zp:
             assert self.should_preprocess_for_int2fp
+
         if self.use_packed_k_layout:
             assert self.weight_bits % 2 == 0, "use_packed_k_layout requires even-bit weight"
+
+        if self.use_signed_s4_kmajor_layout:
+            assert self.use_wgmma and self.is_weight_packed
+            assert not self.use_fused_e8m0_scale
+            assert not self.use_native_dequant
+            assert self.use_packed_k_layout, "signed-S4 K-major layout requires use_packed_k_layout"
+            assert self.weight_bits == 4, "signed-S4 K-major layout requires 4-bit weight"
+            assert self.activation_bits == 8, "signed-S4 K-major layout requires 8-bit activation"
+            assert not self.should_preprocess_for_int2fp, (
+                "signed-S4 K-major layout is int-only, not int->fp"
+            )
+            assert not self.should_preprocess_with_zp, (
+                "signed-S4 K-major layout requires a symmetric weight"
+            )
 
         should_transpose_mini_block = self.use_wgmma and not self.use_fused_e8m0_scale
 
@@ -46,6 +62,7 @@ class RepackWeightKernel(KernelRuntime):
             use_wgmma=int(should_transpose_mini_block),
             group_size_zp=self.group_size_zp,
         )
+
         self.kernel_expr = (
             f"weight_repack_nk<\n"
             f"    {self.weight_bits},\n"
@@ -56,8 +73,10 @@ class RepackWeightKernel(KernelRuntime):
             f"    {int(should_transpose_mini_block)},\n"
             f"    {self.group_size_zp},\n"
             f"    {int(self.use_packed_k_layout)},\n"
-            f"    {int(self.use_native_dequant)}>"
+            f"    {int(self.use_native_dequant)},\n"
+            f"    {int(self.use_signed_s4_kmajor_layout)}>"
         )
+
         self.arg_types = (
             ctypes.c_void_p,
             ctypes.c_void_p,
@@ -68,6 +87,7 @@ class RepackWeightKernel(KernelRuntime):
             ctypes.c_uint32,
             ctypes.c_uint32,
         )
+
         self.prepare()
 
     def __call__(
@@ -80,9 +100,11 @@ class RepackWeightKernel(KernelRuntime):
         interleave_mode: int = 3,
     ):
         func = self.load_cubin()
+
         num_experts = 1 if inputs.ndim == 2 else inputs.size(0)
         shape_n = inputs.size(-2)
         shape_k = inputs.size(-1)
+
         if self.is_weight_packed:
             assert shape_k * 32 % self.weight_bits == 0
             shape_k = shape_k * 32 // self.weight_bits

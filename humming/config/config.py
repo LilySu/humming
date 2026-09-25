@@ -7,6 +7,7 @@ import torch
 
 from humming import dtypes
 from humming.config.base import BaseHummingConfig
+
 from humming.config.enum import (
     ActivationType,
     GemmType,
@@ -16,6 +17,7 @@ from humming.config.enum import (
     WeightScale2Type,
     WeightScaleType,
 )
+from humming.config.enum import GemmType, InputQuantizationMode, MmaType, WeightScale2Type, WeightScaleType
 from humming.device import DeviceInfo, current_device
 from humming.utils.math import round_up
 
@@ -83,6 +85,7 @@ class LayerConfig(BaseHummingConfig):
         "is_token_input_scale_2",
         "is_tensor_input_scale_2",
         "use_native_dequant",
+        "use_signed_s4_kmajor_layout",
     )
 
     @property
@@ -112,6 +115,18 @@ class LayerConfig(BaseHummingConfig):
             )
 
         return self.b_dtype in accepted_b_dtype
+
+
+    @property
+    def use_signed_s4_kmajor_layout(self) -> bool:
+        return (
+            self.a_dtype == dtypes.int8
+            and self.b_dtype == dtypes.uint4
+            and self.use_packed_k_layout
+            and not self.has_zero_point
+            and not self.is_fp_zero_point
+        )
+
 
     @property
     def mxmma_supported(self):
@@ -313,7 +328,6 @@ class LayerConfig(BaseHummingConfig):
             assert self.a_dtype.num_bits == 8, "use_packed_k_layout requires 8-bit activation"
             assert self.b_dtype.num_bits % 2 == 0, "use_packed_k_layout requires even-bit weight"
             assert not self.use_fused_e8m0_scale, "packed_k_layout is incompatible with fused-e8m0"
-
         if type(self) is LayerConfig:
             self._config_str = self.to_str()
 

@@ -24,12 +24,45 @@ HummingKernel configurations are divided into three categories:
 | `has_zero_point` | Whether to enable zero point. When enabled, the dequantization changes from `x * scale` to `(x - zp) * scale`. Humming supports two zero point types (see below). |
 | `is_fp_zero_point` | Whether to use FP-type zero point. See `has_zero_point` for details. |
 | `has_bias` | Whether to use fused bias addition. |
+| `use_umma_ss` | Use shared-memory operands for native UMMA FP8/FP6/FP4 instead of the default TS path. Set before transforming weights; SS uses K-contiguous packed weight rows and requires `use_tma_b=True`. |
 | `mma_type` | Can be `mma`, `wgmma`, `umma`, or `mxmma`. This selects the weight layout and preferred tensor-core backend. |
 | `use_fused_e8m0_scale` | Fuse E8M0 group scales into MXFP4-to-FP8/INT8 weight conversion. Weight preprocessing extracts a secondary scale. |
 | `use_packed_k_layout` | Pack K slabs for WGMMA with 8-bit activations and even-bit weights. Can be explicitly enabled together with `use_fused_e8m0_scale`; transformed weights must use the same setting as the kernel. |
 
-`umma` requires SM100-family GPUs, CUDA 12.9+, and FP16/BF16 inputs/outputs with FP32
-accumulation. It shares the `mma` weight layout; tuning selects the backend per shape.
+`umma` requires SM100-family GPUs and CUDA 12.9+, with FP16/BF16 outputs and FP32
+accumulation. It supports FP16/BF16, FP8 and FP4 inputs. The default TS path shares
+the `mma` weight layout where operand formats are compatible; tuning selects the
+backend per shape.
+
+`use_umma_ss=True` selects a distinct weight layout for native low-bit operands,
+so transformed SS weights cannot be passed to TS or MMA kernels. It supports
+unscaled FP8/FP6/FP4 weights and the existing microscaled combinations, including
+MXFP8, MXFP4 and NVFP4. FP4/FP6 weights paired with FP8 inputs are expanded by TMA
+in shared memory. SS uses 256 threads: loading/issuing/scales in the first warpgroup,
+and the existing epilogue in the second. Dense and MoE scheduling, secondary scales,
+Stream-K, and cooperative two-CTA execution use the same interfaces as TS.
+SS keeps the input-scale global-memory layout unchanged. It rearranges scales
+in the existing AS shared-memory storage when the M tile is 128-row aligned,
+and uses scratch storage otherwise. Scale copies and MMA instructions share
+one issuer and one TMEM scale buffer. With separate TMA loading warps, AS has
+its own completion barrier. When scales can be prepared without reading B/BS,
+two-CTA SS loads publish A/B completion to the issuer through cooperative TMA;
+the scale warp can prepare AS before those operands finish loading. Indexed SS
+keeps all activation-loading threads on cp.async and tracks TMA weight completion
+separately, so scale preparation can overlap B/BS loading.
+
+With chunked output, separate output storage and non-indexed scheduling, SS
+uses the available TMEM capacity for an overlapping accumulator pair. The
+epilogue reads overlapping rows first so the next tile can begin computing.
+Native FP4 SS stages whose K size is a multiple of 256 use K64+96+96 issues
+per 256 elements. Other stage sizes retain the standard instruction shape.
+Indexed SS also overlaps chunked output with the next accumulator tile; row-index
+buffers are released separately after output scatter finishes. MoE selection
+accounts for SS's single scale buffer, chunked output, and cooperative CTA pairs.
+It retains whole-tile output for small M tiles and uses sampled expert sizes and
+available work to avoid underfilled tiles and short cooperative pipelines.
+These optimizations are selected internally; TS keeps its existing schedule.
+SS remains opt-in; a smaller thread count does not guarantee a faster kernel.
 
 **`use_int_weight_scale` preprocessing:**
 
@@ -140,23 +173,54 @@ Each N partition writes only its own columns; the accumulator is released only
 after the last partition has been read. Reusing stage SMEM waits for output
 completion before loading the next tile, reducing load/epilogue overlap.
 
-Two-CTA execution supports TMA or cp.async stage loads, including indexed A
-gathers. Each CTA loads only its own half of A; both CTAs publish operand
-readiness before the leader issues UMMA. It requires chunked output, N divisible
-by twice block N, and `num_ctas_per_sm=1`. Activation scales are not supported in
-this cooperative pipeline. Channel weight scales, channel secondary scales,
+Two-CTA execution still requires chunked output, N divisible by twice block N,
+and `num_ctas_per_sm=1`. Both TMA and cp.async stage loads are supported,
+including indexed A gathers. Each CTA loads only its own half of A; both CTAs
+publish operand readiness before the leader issues UMMA.
+Cooperative instructions support FP16/BF16, ordinary FP8 with FP8/FP6/FP4
+weights, and MXFP8 with MXFP8/MXFP6/MXFP4 weights and group-32 E8M0 scales.
+FP4 activations use native `mxf4nvf4` instructions with packed FP4 weights:
+MXFP4 uses group-32 E8M0, while group-16 supports E8M0 or E4M3 (NVFP4).
+Both one-CTA and two-CTA execution support these formats. The SM100 dispatcher
+also selects UMMA for supported FP4 activation configurations.
+
+TS also supports lower-bit integer weights, such as INT2 with MXFP4 or NVFP4
+activations, through the existing register conversion and TMEM store path.
+Hardware group scales must be nonnegative (E8M0 or unsigned E4M3).
+Either operand may omit group scales: its hardware scales are filled with one,
+while tensor/token activation scales and tensor/channel weight scales are applied
+in the epilogue. This includes tokenwise FP4 with channelwise FP4 in TS and SS.
+
+SM100-family UMMA also supports the undocumented `float8e3m4` and
+`float4e0m3` formats. E3M4 supports ordinary FP8 and group-32 E8M0 scaling;
+E0M3 requires group-16 E8M0 or E4M3 scales (group-32 faults in hardware).
+Activation and weight formats may differ, including E3M4 with ordinary
+FP8/FP6/FP4 weights and E0M3 with E2M1 weights, in either FP4 operand.
+UMMA selects these formats directly in its instruction descriptor. Input
+quantization uses the existing F2FP cubin patcher, extended to SM100/103;
+SM120/121 MMA patching remains unchanged.
+
+Tensor/token activation scales and MX activation scales use the existing
+loaders. `static_tensor_dynamic_group` applies the secondary tensor scale in
+the UMMA epilogue; NVFP4 `dynamic_group_token` similarly applies the secondary
+per-token scale before output conversion. Input-scale GMEM layout is unchanged.
+The TMEM scale allocation pads small M tiles to keep successive K scale words
+aligned. The resource estimator accounts for the scale group size and padding.
+Channel weight scales, channel secondary scales,
 bias, and channel/group zero points reuse the existing loaders and arithmetic.
 Channel parameters are released once all consuming threads have read them.
 Both output paths support Stream-K: the first slice stores each chunk, later
 slices reduce into it, and partial writes complete before releasing the output
 lock. Bias is applied only by the first slice.
 
-SM100 dense heuristics select two CTAs with six stages when the tile is suitable,
+SM100 FP16/BF16 dense heuristics select two CTAs with six stages when the tile is suitable,
 K is long enough to amortize the pipeline, and the estimated shared-memory
 allocation fits. The existing Stream-K decision is preserved for CTA pairs.
 Without Stream-K, underfilled output waves retain single-CTA execution. Chunked
 output remains opt-in for single-CTA execution because it did not improve the
-measured large dense cases by itself.
+measured large dense cases by itself. FP8/FP4 cooperative execution is currently
+explicitly configured with `umma_cta_group_size=2` and
+`umma_output_chunk_rows=32`; automatic cooperative selection remains limited to FP16/BF16.
 
 ### SM100 MoE tile selection
 

@@ -250,6 +250,7 @@ def transform_humming_weight(
     interleave_mode: int = 3,
     use_packed_k_layout: bool = False,
     use_native_dequant: bool = False,
+    use_umma_ss: bool = False,
 ) -> torch.Tensor:
     is_moe = weight.ndim == 3
     weight = weight.unsqueeze(0) if not is_moe else weight
@@ -269,6 +270,24 @@ def transform_humming_weight(
     assert padded_shape_n % 64 == 0
     assert padded_shape_k % (2 * packed_block_size_k) == 0
 
+    if a_dtype == dtypes.int8 and b_dtype in [dtypes.int8, dtypes.uint8]:
+        if not packed:
+            weight = ops.pack_weight(weight, b_dtype.num_bits)
+            packed = True
+        # Both TS and SS consume signed INT8 instead of offset-binary weight codes.
+        weight = (weight.view(torch.int8) - 128).view(torch.int32)
+
+    if use_umma_ss:
+        if a_dtype.num_bits == 8 and b_dtype.num_bits < 8:
+            padded_shape_k = round_up(padded_shape_k, 128)
+        # K-contiguous rows are consumed directly by the shared-memory MMA operand.
+        if not packed:
+            weight = ops.pack_weight(weight, b_dtype.num_bits)
+        weight = torch.nn.functional.pad(
+            weight, (0, (padded_shape_k - shape_k) * b_dtype.num_bits // 32, 0, padded_shape_n - shape_n)
+        )
+        return weight if is_moe else weight.squeeze(0)
+
     should_preprocess_for_int2fp = False
     has_zero_point = zero_point is not None and zero_point.nelement() > 0
     if b_dtype.is_integer_type and a_dtype.is_floating_point_type:
@@ -278,9 +297,6 @@ def transform_humming_weight(
             should_preprocess_for_int2fp = b_dtype.num_bits > 6
         elif a_dtype == dtypes.bfloat16 and not has_zero_point:
             should_preprocess_for_int2fp = b_dtype.num_bits > 7
-
-    if a_dtype == dtypes.int8 and b_dtype in [dtypes.int8, dtypes.uint8]:
-        weight = (weight.view(torch.int8) - 128).view(torch.int32)
 
     if a_dtype == dtypes.int4 and b_dtype in [dtypes.int4, dtypes.uint4]:
         weight = weight.view(torch.uint8)
@@ -345,9 +361,23 @@ def transform_humming_weight_scale(
     is_blockwise: bool = False,
     is_mxmma: bool = False,
     mxmma_scale_vec: int = 4,
+    is_umma: bool = False,
 ) -> torch.Tensor:
     if is_blockwise:
         return weight_scale.transpose(-1, -2).contiguous()
+
+    if is_umma:
+        # One copy tile holds 128 channels and four consecutive K scales.
+        scales = weight_scale.view(torch.uint8)
+        lead = scales.shape[:-2]
+        n, groups = scales.shape[-2:]
+        scales = torch.nn.functional.pad(scales, (0, -groups % 4, 0, -n % 128), value=127)
+        padded_n, padded_groups = scales.shape[-2:]
+        scales = scales.reshape(*lead, padded_n // 128, 4, 32, padded_groups // 4, 4)
+        ndim = len(lead)
+        order = (*range(ndim), ndim + 3, ndim, ndim + 2, ndim + 1, ndim + 4)
+        scales = scales.permute(*order).contiguous()
+        return scales.view(torch.int32).reshape(*lead, padded_groups // 4, padded_n)
 
     if is_mxmma:
         if mxmma_scale_vec == 1:
@@ -470,10 +500,11 @@ def transform_humming_tensors(
         interleave_mode=interleave_mode,
         use_packed_k_layout=config.use_packed_k_layout,
         use_native_dequant=config.use_native_dequant,
+        use_umma_ss=config.use_umma_ss,
     )
 
     if weight_scale is not None:
-        is_mxmma = config.mma_type == MmaType.MXMMA and (
+        is_mxmma = config.use_block_scaled_mma and (
             config.is_group_weight_scale or config.is_block_weight_scale
         )
         mxmma_scale_vec = None
@@ -486,6 +517,7 @@ def transform_humming_tensors(
             is_blockwise=config.weight_scale_type == WeightScaleType.BLOCK,
             is_mxmma=is_mxmma,
             mxmma_scale_vec=mxmma_scale_vec,
+            is_umma=is_mxmma and config.mma_type == MmaType.UMMA,
         )
 
     if zero_point is not None:

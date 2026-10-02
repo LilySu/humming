@@ -10,6 +10,26 @@
 
 // Conditional member macros: when the condition is false, the member is completely eliminated.
 
+#if HUMMING_IS_GROUP_INPUT_SCALE && HUMMING_BLOCK_SHAPE_M % 128 == 0
+#define HUMMING_UMMA_INPLACE_INPUT_SCALE 1
+#else
+#define HUMMING_UMMA_INPLACE_INPUT_SCALE 0
+#endif
+
+#if HUMMING_IS_GROUP_WEIGHT_SCALE && HUMMING_BLOCK_SHAPE_N >= 128 && HUMMING_BLOCK_SHAPE_K % (4 * HUMMING_WEIGHT_SCALE_GROUP_SIZE) == 0
+#define HUMMING_UMMA_DIRECT_WEIGHT_SCALE 1
+#else
+#define HUMMING_UMMA_DIRECT_WEIGHT_SCALE 0
+#endif
+
+#if HUMMING_USE_UMMA_SS && HUMMING_USE_BLOCK_SCALED_MMA && \
+    ((HUMMING_IS_GROUP_INPUT_SCALE && !HUMMING_UMMA_INPLACE_INPUT_SCALE) || \
+     (HUMMING_IS_GROUP_WEIGHT_SCALE && !HUMMING_UMMA_DIRECT_WEIGHT_SCALE))
+#define IF_HAS_UMMA_SCALE_SCRATCH(x) x
+#else
+#define IF_HAS_UMMA_SCALE_SCRATCH(x)
+#endif
+
 #if HUMMING_HAS_INPUT_SCALE && HUMMING_INPUT_SCALE_GROUP_SIZE > 0
 #define IF_HAS_STAGE_INPUT_SCALE(x) x
 #else
@@ -52,7 +72,7 @@
 #define IF_HAS_BIAS(x)
 #endif
 
-#if (HUMMING_HAS_INPUT_SCALE && HUMMING_INPUT_SCALE_GROUP_SIZE == 0 && !HUMMING_IS_TENSOR_INPUT_SCALE) || (HUMMING_HAS_INPUT_SCALE_2 && !HUMMING_IS_TENSOR_INPUT_SCALE_2)
+#if (HUMMING_HAS_INPUT_SCALE && HUMMING_INPUT_SCALE_GROUP_SIZE == 0 && !HUMMING_IS_TENSOR_INPUT_SCALE) || (HUMMING_MMA_TYPE_ID != 2 && HUMMING_HAS_INPUT_SCALE_2 && !HUMMING_IS_TENSOR_INPUT_SCALE_2)
 #define IF_HAS_CHANNEL_INPUT_SCALE(x) x
 #else
 #define IF_HAS_CHANNEL_INPUT_SCALE(x)
@@ -105,11 +125,11 @@ private:
   static_assert(!ComputeConfig::kUseBatchInvariant || !TuningConfig::kUseStreamK);
   static_assert(!ComputeConfig::kUseBatchInvariant || BlockShape::K == WarpShape::K);
 
-  static constexpr bool kUseMxmma = MmaOpClass::kMmaType == MmaType::MXMMA;
+  static constexpr bool kUseBlockScaledMma = LayerConfig::kUseBlockScaledMma;
   static constexpr bool kHasInputScale = LayerConfig::kHasInputScale;
   static constexpr bool kHasInputScale2 = LayerConfig::kHasInputScale2;
   static constexpr bool kIsChannelInputScale = kHasInputScale && !LayerConfig::kIsGroupInputScale && !LayerConfig::kIsTensorInputScale;
-  static constexpr bool kIsChannelInputScale2 = kHasInputScale2 && !LayerConfig::kIsTensorInputScale2;
+  static constexpr bool kIsChannelInputScale2 = LayerConfig::kMmaType != MmaType::UMMA && kHasInputScale2 && !LayerConfig::kIsTensorInputScale2;
   static constexpr bool kIsGroupInputScale = kHasInputScale && LayerConfig::kIsGroupInputScale;
   static constexpr bool kHasChannelInputScale = kIsChannelInputScale || kIsChannelInputScale2;
   static constexpr bool kIsChannelWeightScale = LayerConfig::kIsChannelWeightScale;
@@ -152,12 +172,38 @@ public:
   static constexpr uint32_t kScaleBlockM = BlockShape::M + (kIsGroupedGemm ? kScaleMAlignment : 0);
 
   static constexpr uint32_t kStageSizeA = BlockShape::M / TuningConfig::kUmmaCtaGroupSize * kSmemStrideA;
-  static constexpr uint32_t kStageSizeB = BlockShape::K / kPartMmaShapeK * kSmemStrideB;
+  static constexpr bool kExpandUmmaWeight = LayerConfig::kUseUmmaSs && ElementA::kBits == 8 && ElementB::kBits < 8;
+  static constexpr uint32_t kWeightSmemBits = kExpandUmmaWeight ? 8 : ElementB::kBits;
+  // Expanded TMA coordinates are 128-element aligned; cover the leading K offset.
+  static constexpr uint32_t kWeightKAlignment = BlockShape::K % 128 == 0 ? 128 : (BlockShape::K % 64 == 0 ? 64 : 32);
+  static constexpr uint32_t kWeightStageK = kExpandUmmaWeight
+                                                ? CEIL_DIV(BlockShape::K + 128 - kWeightKAlignment, 128) * 128
+                                                : BlockShape::K;
+  static constexpr uint32_t kUmmaScaleWords = CEIL_DIV(BlockShape::K, 4 * LayerConfig::kMmaScaleGroupSize);
+  static constexpr uint32_t kUmmaWeightScaleRows = MAX(BlockShape::N, 128);
+  static constexpr bool kUseUmmaDirectWeightScale = LayerConfig::kUseUmmaSs && kIsGroupWeightScale &&
+                                                    BlockShape::N >= 128 && BlockShape::K % (4 * MAX(1u, kGroupSizeB)) == 0;
+  static constexpr uint32_t kUmmaWeightScaleScratchRows = kIsGroupWeightScale && !kUseUmmaDirectWeightScale ? kUmmaWeightScaleRows : 0;
+  static constexpr uint32_t kUmmaInputScaleRows = CEIL_DIV(BlockShape::M, 128) * 128;
+  // Keep contiguous scale vectors intact during indexed cp.async gathers.
+  // Only the stage layout changes; the input tensor keeps its original layout.
+  static constexpr bool kUseUmmaRowMajorSmemInputScale = LayerConfig::kUseUmmaSs && kIsIndexedGemm && kIsGroupInputScale &&
+                                                         BlockShape::K % (16 * MAX(1u, kGroupSizeA)) == 0;
+  static constexpr bool kUseUmmaInplaceInputScale = LayerConfig::kUseUmmaSs && kIsGroupInputScale &&
+                                                    BlockShape::M % 128 == 0;
+  static constexpr uint32_t kUmmaInputScaleScratchRows = kIsGroupInputScale && !kUseUmmaInplaceInputScale ? kUmmaInputScaleRows : 0;
+  static constexpr uint32_t kStageSizeUmmaScales = LayerConfig::kUseUmmaSs && kUseBlockScaledMma
+                                                       ? kUmmaScaleWords * (kUmmaWeightScaleScratchRows + kUmmaInputScaleScratchRows) / 4
+                                                       : 0;
+  static constexpr uint32_t kWeightStageN = LayerConfig::kUseUmmaSs ? MAX(BlockShape::N, 128) : BlockShape::N;
+  static constexpr uint32_t kStageSizeB = kWeightStageK * kWeightStageN * kWeightSmemBits / 128;
   static constexpr uint32_t kNumGroupsAStorage = CEIL_DIV(kNumGroupsA, 4) * 4;
-  static constexpr uint32_t kStageSizeAS = kUseMxmma
+  static constexpr uint32_t kStageSizeAS = kUseBlockScaledMma
                                                ? CEIL_DIV(kNumGroupsAStorage * kScaleBlockM, sizeof(int4))
                                                : kNumGroupsA * kScaleBlockM / 4;
-  static constexpr uint32_t kStageSizeBS = kNumGroupsB * kSmemStrideBS;
+  static constexpr uint32_t kStageSizeBS = kUseBlockScaledMma && LayerConfig::kMmaType == MmaType::UMMA
+                                               ? CEIL_DIV(kNumGroupsB, 4) * MAX(BlockShape::N, 128) / 4
+                                               : kNumGroupsB * kSmemStrideBS;
   static constexpr uint32_t kStageSizeBZP = kNumGroupsB * kSmemStrideBZP;
 
   static constexpr uint32_t kChannelSizeAS = kHasChannelInputScale ? kScaleBlockM / 4 : 0;
@@ -168,6 +214,8 @@ public:
 
   static constexpr uint32_t kStageBytesA = kStageSizeA * sizeof(int4);
   static constexpr uint32_t kStageBytesB = kStageSizeB * sizeof(int4);
+  // TMA expansion reports the packed source bytes, not the padded SMEM bytes.
+  static constexpr uint32_t kStageLoadBytesB = kWeightStageK * kWeightStageN * ElementB::kBits / 8;
   static constexpr uint32_t kStageBytesAS = kStageSizeAS * sizeof(int4);
   static constexpr uint32_t kStageBytesBS = kStageSizeBS * sizeof(int4);
   static constexpr uint32_t kStageBytesBZP = kStageSizeBZP * sizeof(int4);
@@ -181,10 +229,11 @@ public:
   static constexpr bool kUseMBarrier = TuningConfig::kUseMBarrier;
   struct StageStorage {
     alignas(1024) int4 a[kStageSizeA];
-    alignas(128) int4 b[kStageSizeB];
+    alignas(LayerConfig::kUseUmmaSs ? 1024 : 128) int4 b[kStageSizeB];
     IF_HAS_STAGE_INPUT_SCALE(alignas(128) int4 as[kStageSizeAS];)
     IF_HAS_STAGE_WEIGHT_SCALE(alignas(128) int4 bs[kStageSizeBS];)
     IF_HAS_STAGE_ZERO_POINT(alignas(128) int4 bzp[kStageSizeBZP];)
+    IF_HAS_UMMA_SCALE_SCRATCH(alignas(128) int4 umma_scales[kStageSizeUmmaScales];)
   };
 
   IF_HAS_CHANNEL_ZERO_POINT(alignas(128) int4 bzp_c[kChannelSizeBZP];)
@@ -220,9 +269,15 @@ public:
   IF_USE_WARP_SPEC(uint64_t math_mbar[kNumMathMbarriers];)
   IF_USE_UMMA(uint64_t umma_accumulator_ready;)
   IF_USE_UMMA(uint64_t umma_accumulator_free;)
+#if HUMMING_USE_UMMA_SS
+  IF_IS_INDEXED_GEMM(uint64_t umma_row_index_free[2];)
+#endif
   IF_USE_UMMA(uint32_t umma_tmem_col;)
   IF_USE_UMMA(uint64_t umma_operand_ready[kNumStages];)
   IF_USE_UMMA(uint64_t umma_operand_free[MAX(kNumStages, 4)];)
   IF_USE_UMMA(uint64_t umma_weight_ready[kNumStages];)
-  IF_USE_UMMA(uint64_t umma_weight_free[kNumStages];)
+  IF_USE_UMMA(union {
+    uint64_t umma_weight_free[kNumStages];
+    uint64_t umma_input_scale_ready[kNumStages];
+  };)
 };

@@ -65,6 +65,8 @@ class LayerConfig(BaseHummingConfig):
 
     # packed-K layout (wgmma + 8-bit activation + even-bit weight only)
     use_packed_k_layout: bool | None = None
+    # Native UMMA weights in K-contiguous rows for shared-memory operands.
+    use_umma_ss: bool = False
 
     _cpp_extra_names: ClassVar[tuple[str, ...]] = (
         "mma_type_id",
@@ -84,7 +86,28 @@ class LayerConfig(BaseHummingConfig):
         "is_token_input_scale_2",
         "is_tensor_input_scale_2",
         "use_native_dequant",
+        "use_block_scaled_mma",
+        "mma_scale_group_size",
     )
+
+    @property
+    def use_block_scaled_mma(self):
+        if self.mma_type == MmaType.MXMMA:
+            return True
+        has_group_scales = self.input_scale_group_size > 0 or self.weight_scale_group_size > 0
+        return (
+            self.mma_type == MmaType.UMMA
+            and self.a_dtype.is_floating_point_type and self.a_dtype.num_bits <= 8
+            and (self.a_dtype.num_bits == 4 or has_group_scales)
+        )
+
+    @property
+    def mma_scale_group_size(self):
+        group_size = self.input_scale_group_size or self.weight_scale_group_size
+        if group_size:
+            return group_size
+        has_e0m3_operand = dtypes.float4e0m3 in (self.a_dtype, self.b_dtype)
+        return 16 if has_e0m3_operand else 32
 
     @property
     def use_native_dequant(self):
@@ -229,20 +252,80 @@ class LayerConfig(BaseHummingConfig):
             self.mma_type = MmaType(self.mma_type)
         elif self.mma_type is None:
             assert self.sm_version is not None
+            has_fp8_epilogue_scales = (
+                not self.is_group_input_scale
+                and not self.is_group_weight_scale
+                and not self.is_block_weight_scale
+            )
+            has_fp8_output = self.c_dtype in (dtypes.float16, dtypes.bfloat16)
+            has_fp8_activation = self.a_dtype in (dtypes.float8e4m3, dtypes.float8e5m2, dtypes.float8e3m4)
+            has_fp8_weights = self.b_dtype in (
+                dtypes.float8e4m3,
+                dtypes.float8e5m2,
+                dtypes.float8e3m4,
+                dtypes.float4e2m1,
+                dtypes.float6e3m2,
+                dtypes.float6e2m3,
+            )
+            has_fp8_operands = has_fp8_activation and (has_fp8_weights or self.b_dtype.is_integer_type)
+            has_mx_input_scale = self.input_scale_group_size == 0 or (
+                self.input_scale_group_size == 32 and self.as_dtype in (None, dtypes.float8e8m0)
+            )
+            has_mx_weight_scale = self.weight_scale_group_size == 0 or (
+                self.weight_scale_group_size == 32 and self.bs_dtype == dtypes.float8e8m0
+            )
+            has_mx_scales = (
+                has_mx_input_scale and has_mx_weight_scale
+                and not self.has_zero_point and not self.is_block_weight_scale
+            )
+            has_supported_fp8_scales = has_fp8_epilogue_scales or has_mx_scales
+            use_fp8_umma = has_fp8_output and has_fp8_operands and has_supported_fp8_scales
+            fp4_dtypes = (dtypes.float4e2m1, dtypes.float4e0m3)
+            has_fp4_weights = self.b_dtype in fp4_dtypes or self.b_dtype.is_integer_type
+            has_fp4_operands = self.a_dtype in fp4_dtypes and has_fp4_weights
+            fp4_group_size = self.input_scale_group_size or self.weight_scale_group_size
+            fp4_scale_dtype = (self.as_dtype or self.bs_dtype) if self.is_group_input_scale else self.bs_dtype
+            has_fp4_scale_format = fp4_group_size == 0 or (fp4_group_size, fp4_scale_dtype) in (
+                (32, dtypes.float8e8m0),
+                (16, dtypes.float8e8m0),
+                (16, dtypes.float8e4m3),
+            )
+            has_both_group_scales = self.is_group_input_scale and self.is_group_weight_scale
+            has_matching_group_scales = not has_both_group_scales or (
+                self.input_scale_group_size == self.weight_scale_group_size
+                and self.as_dtype in (None, self.bs_dtype)
+            )
+            has_fp4_scales = (
+                has_fp4_scale_format
+                and has_matching_group_scales
+                and not self.has_zero_point
+                and not self.is_block_weight_scale
+            )
+            use_fp4_umma = has_fp8_output and has_fp4_operands and has_fp4_scales
+            use_bf16_umma = self.a_dtype == self.c_dtype == dtypes.bfloat16
+            has_int8_operands = self.a_dtype == dtypes.int8 and self.b_dtype.is_integer_type
+            use_int8_umma = (
+                self.sm_version in (100, 110) and has_int8_operands
+                and has_fp8_output and has_fp8_epilogue_scales
+            )
+            use_umma = use_bf16_umma or use_fp8_umma or use_fp4_umma or use_int8_umma
             if self.sm_version // 10 == 9:
                 self.mma_type = MmaType.WGMMA
             elif self.mxmma_supported:
                 self.mma_type = MmaType.MXMMA
-            elif self.sm_version // 10 == 10 and self.a_dtype == self.c_dtype == dtypes.bfloat16:
+            elif self.sm_version // 10 in (10, 11) and use_umma:
                 from humming.jit.runtime import KernelRuntime
 
                 version = _cuda_compiler_version(KernelRuntime._get_compiler())
                 self.mma_type = MmaType.UMMA if version >= (12, 9) else MmaType.MMA
             else:
                 self.mma_type = MmaType.MMA
+        has_e0m3_operand = dtypes.float4e0m3 in (self.a_dtype, self.b_dtype)
+        if self.mma_type == MmaType.UMMA and self.a_dtype.num_bits == 4 and has_e0m3_operand:
+            assert self.mma_scale_group_size == 16, "E0M3 UMMA requires scale group size 16"
         if self.has_input_scale_2:
-            assert self.mma_type == MmaType.MXMMA, f"{self.input_quant_mode.value} requires mma_type='mxmma'"
-        if self.mma_type == MmaType.MXMMA and self.is_group_weight_scale and self.input_scale_group_size > 0:
+            assert self.use_block_scaled_mma, f"{self.input_quant_mode.value} requires block-scaled MMA"
+        if self.use_block_scaled_mma and self.is_group_weight_scale and self.input_scale_group_size > 0:
             assert self.input_scale_group_size == self.weight_scale_group_size
         if self.input_quant_mode == InputQuantizationMode.DynamicGroupToken:
             assert self.a_dtype in (dtypes.float4e2m1, dtypes.float4e0m3)
@@ -251,7 +334,7 @@ class LayerConfig(BaseHummingConfig):
         if not self.has_input_scale:
             self.as_dtype = None
         elif self.as_dtype is None:
-            if self.mma_type == MmaType.MXMMA and self.input_scale_group_size > 0:
+            if self.use_block_scaled_mma and self.input_scale_group_size > 0:
                 if self.is_group_weight_scale:
                     self.as_dtype = self.bs_dtype
                 elif self.input_scale_group_size == 16:
@@ -263,13 +346,13 @@ class LayerConfig(BaseHummingConfig):
 
         if self.input_quant_mode == InputQuantizationMode.DynamicGroupToken:
             assert self.as_dtype == dtypes.float8e4m3
-        if self.mma_type == MmaType.MXMMA and self.is_group_input_scale and self.is_group_weight_scale:
+        if self.use_block_scaled_mma and self.is_group_input_scale and self.is_group_weight_scale:
             assert self.as_dtype == self.bs_dtype
 
         is_channel_scale_2 = self.weight_scale_2_type == WeightScale2Type.CHANNEL
 
         if self.use_fused_e8m0_scale is None:
-            has_native_mxf8f6f4 = self.mma_type == MmaType.MXMMA and self.a_dtype == dtypes.float8e4m3
+            has_native_mxf8f6f4 = self.use_block_scaled_mma and self.a_dtype == dtypes.float8e4m3
             self.use_fused_e8m0_scale = (
                 not has_native_mxf8f6f4
                 and self.a_dtype in [dtypes.float8e4m3, dtypes.int8]
@@ -300,6 +383,14 @@ class LayerConfig(BaseHummingConfig):
             if not is_channel_scale_2:
                 self.weight_scale_2_type = WeightScale2Type.TENSOR
             self._update_weight_scale_flags()
+
+        if self.use_umma_ss:
+            assert self.mma_type == MmaType.UMMA, "SS operands require UMMA"
+            has_float_weights = self.b_dtype.is_floating_point_type and self.b_dtype.num_bits in (4, 6, 8)
+            has_int8_weights = self.a_dtype == self.b_dtype == dtypes.int8
+            assert has_float_weights or has_int8_weights
+            assert not self.has_zero_point and not self.is_block_weight_scale
+            assert self.a_dtype.num_bits in (4, 8), "SS operands require native 4-bit or 8-bit MMA"
 
         if self.use_packed_k_layout is None:
             self.use_packed_k_layout = (
@@ -445,6 +536,7 @@ class TuningConfig(BaseHummingConfig):
 
     num_stages: int = 2
     num_ctas_per_sm: int = 1
+    umma_num_dequant_warpgroups: int = 1
     umma_cta_group_size: int = 1
     umma_output_chunk_rows: int = 0
 

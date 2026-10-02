@@ -40,7 +40,7 @@ private:
   static constexpr bool kIsTensorInputScale = Ctx::kIsTensorInputScale;
   static constexpr bool kIsTensorInputScale2 = Ctx::kIsTensorInputScale2;
   static constexpr bool kIsChannelInputScale = kHasInputScale && !Ctx::kIsGroupInputScale && !kIsTensorInputScale;
-  static constexpr bool kIsChannelInputScale2 = kHasInputScale2 && !kIsTensorInputScale2;
+  static constexpr bool kIsChannelInputScale2 = !Ctx::kUseUmma && kHasInputScale2 && !kIsTensorInputScale2;
   static constexpr bool kIsGroupInputScale = kHasInputScale && Ctx::kIsGroupInputScale;
   static constexpr bool kIsChannelWeightScale = Ctx::kIsChannelWeightScale;
   static constexpr bool kIsChannelWeightScale2 = Ctx::kIsChannelWeightScale2;
@@ -62,8 +62,8 @@ private:
     if constexpr (kUseTmaA) tma_load_bytes += SharedStorage::kStageBytesA;
     else legacy_load_bytes += SharedStorage::kStageBytesA;
 
-    if constexpr (kUseTmaB) tma_load_bytes += SharedStorage::kStageBytesB;
-    else legacy_load_bytes += SharedStorage::kStageBytesB;
+    if constexpr (kUseTmaB) tma_load_bytes += SharedStorage::kStageLoadBytesB;
+    else legacy_load_bytes += SharedStorage::kStageLoadBytesB;
 
     if constexpr (kIsGroupInputScale) {
       if constexpr (kUseTmaAS) tma_load_bytes += SharedStorage::kStageBytesAS;
@@ -185,7 +185,9 @@ public:
       if (thread_id < kNumStages) {
         constexpr uint32_t cp_async_thread_count = kHasStageCpAsyncMBarrier ? kNumLoadThreads : 0;
         constexpr uint32_t tma_thread_count = kHasStageTmaMBarrier ? 1 : 0;
-        count = cp_async_thread_count + tma_thread_count;
+        if constexpr (Ctx::kUseUmmaAsyncActivationLoads)
+          count = kNumLoadThreads + (kIsGroupInputScale && kUseTmaAS ? 1 : 0);
+        else count = Ctx::kUseUmmaCooperativeTma ? 2 : cp_async_thread_count + tma_thread_count;
       } else if (thread_id == kNumStages) {
         constexpr uint32_t cp_async_thread_count = kHasFirstStageCpAsyncMBarrier ? kNumLoadThreads : 0;
         constexpr uint32_t tma_thread_count = kHasFirstStageTmaMBarrier ? 1 : 0;
@@ -215,6 +217,20 @@ public:
   CUDA_INLINE void load_stage(uint32_t stage_id, bool pred = true) {
     stage_id = stage_id % kNumStages;
     auto &smem = ctx.smem;
+    if constexpr (Ctx::kUseUmmaAsyncActivationLoads) {
+      // All loading threads gather A/AS; only the elected TMA loading thread
+      // submits B/BS. Keep their completions separate without halving A bandwidth.
+      if (pred) {
+        load_weight_stage<kShouldAdvance>(stage_id);
+        loader_a.template load<kShouldAdvance>(smem.stages[stage_id].a, &smem.load_mbar[stage_id], stage_id);
+        if constexpr (kIsGroupInputScale)
+          loader_as.template load<kShouldAdvance>(smem.stages[stage_id].as, &smem.load_mbar[stage_id]);
+      }
+      commit_cp_async_load<true>(stage_id, pred);
+      if constexpr (kIsGroupInputScale && kUseTmaAS)
+        if (pred) expect_tma_load<true>(&smem.load_mbar[stage_id], SharedStorage::kStageBytesAS);
+      return;
+    }
 
     uint32_t mbar_index = kIsFirst ? kNumStages : stage_id;
     constexpr uint2 load_bytes = get_stage_load_bytes<kIsFirst>();
@@ -250,18 +266,21 @@ public:
   template <bool kShouldAdvance = true>
   CUDA_INLINE void load_weight_stage(uint32_t stage_id) {
     auto &stage = ctx.smem.stages[stage_id];
-    auto *weight_mbar = &ctx.smem.umma_weight_ready[stage_id];
+    constexpr bool kJoinActivation = Ctx::kUseUmmaCooperativeTma && !Ctx::kUseUmmaAsyncActivationLoads;
+    auto *weight_mbar = kJoinActivation ? &ctx.smem.load_mbar[stage_id] : &ctx.smem.umma_weight_ready[stage_id];
     loader_b.template load<kShouldAdvance>(stage.b, weight_mbar);
-    uint32_t bytes = SharedStorage::kStageBytesB;
+    uint32_t bytes = SharedStorage::kStageLoadBytesB;
     if constexpr (kIsGroupWeightScale || kIsBlockWeightScale) {
-      loader_bs.template load<kShouldAdvance>(stage.bs, weight_mbar);
+      loader_bs.template load<kShouldAdvance, Ctx::kUseUmmaCooperativeTma ? 2 : 1>(stage.bs, weight_mbar);
       bytes += SharedStorage::kStageBytesBS;
     }
     if constexpr (kHasZeroPoint && !kIsChannelWeightScale) {
       loader_bzp.template load<kShouldAdvance>(stage.bzp, weight_mbar);
       bytes += SharedStorage::kStageBytesBZP;
     }
-    if (ctx.load_thread_id() == 0) tma_expect_tx(weight_mbar, bytes);
+    if constexpr (Ctx::kUseUmmaCooperativeTma) {
+      if (ctx.load_thread_id() == 0 && blockIdx.x % Ctx::kUmmaCtaGroupSize == 0) tma_expect_tx(weight_mbar, bytes * 2);
+    } else if (ctx.load_thread_id() == 0) tma_expect_tx(weight_mbar, bytes);
   }
 
   template <bool kShouldAdvance = true>
@@ -271,10 +290,18 @@ public:
     loader_a.template load<kShouldAdvance>(stage.a, activation_mbar, stage_id);
     uint32_t bytes = SharedStorage::kStageBytesA;
     if constexpr (kIsGroupInputScale) {
-      loader_as.template load<kShouldAdvance>(stage.as, activation_mbar);
-      bytes += SharedStorage::kStageBytesAS;
+      if constexpr (Ctx::kUseUmmaSeparateInputScale) {
+        auto *scale_mbar = &ctx.smem.umma_input_scale_ready[stage_id];
+        loader_as.template load<kShouldAdvance>(stage.as, scale_mbar);
+        if (ctx.load_thread_id() == 32) tma_expect_tx(scale_mbar, SharedStorage::kStageBytesAS);
+      } else {
+        loader_as.template load<kShouldAdvance>(stage.as, activation_mbar);
+        bytes += SharedStorage::kStageBytesAS;
+      }
     }
-    if (ctx.load_thread_id() == 32) tma_expect_tx(activation_mbar, bytes);
+    if constexpr (Ctx::kUseUmmaCooperativeTma) {
+      if (ctx.load_thread_id() == 32 && blockIdx.x % Ctx::kUmmaCtaGroupSize == 0) tma_expect_tx(activation_mbar, bytes * 2);
+    } else if (ctx.load_thread_id() == 32) tma_expect_tx(activation_mbar, bytes);
   }
 
   CUDA_INLINE void load_channel() {
@@ -378,7 +405,7 @@ private:
   static constexpr bool kHasInputScale = Ctx::kHasInputScale;
   static constexpr bool kHasInputScale2 = Ctx::kHasInputScale2;
   static constexpr bool kIsChannelInputScale = kHasInputScale && !Ctx::kIsGroupInputScale && !Ctx::kIsTensorInputScale;
-  static constexpr bool kIsChannelInputScale2 = kHasInputScale2 && !Ctx::kIsTensorInputScale2;
+  static constexpr bool kIsChannelInputScale2 = !Ctx::kUseUmma && kHasInputScale2 && !Ctx::kIsTensorInputScale2;
   static constexpr bool kIsChannelWeightScale = Ctx::kIsChannelWeightScale;
   static constexpr bool kIsChannelWeightScale2 = Ctx::kIsChannelWeightScale2;
   static constexpr bool kHasBias = Ctx::kHasBias;

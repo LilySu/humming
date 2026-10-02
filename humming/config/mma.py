@@ -34,7 +34,7 @@ DTYPE_MAP = {
     dtypes.float4e2m1: "e2m1",
     dtypes.int4: "s4",
     # Hardware supports these dtypes (e3m4/e0m3) but exposes no matching PTX types.
-    # We substitute other PTX types and patch the cubin afterwards.
+    # MMA/MXMMA substitute PTX types and patch the cubin; UMMA selects descriptor formats.
     dtypes.float8e3m4: "e5m2",
     dtypes.float4e0m3: "e2m1",
 }
@@ -176,6 +176,17 @@ class MmaOpClassImpl:
 
 class UmmaOpClassImpl(MmaOpClassImpl):
     mma_type = MmaType.UMMA
+
+    def __init__(self, m, n, k, a_dtype, b_dtype, cd_dtype, sf_dtype):
+        super().__init__(m, n, k, a_dtype, b_dtype, cd_dtype)
+        self.sf_is_e4m3 = sf_dtype == dtypes.float8e4m3
+
+    def to_cpp_str(self, include_class_name=False):
+        code = super().to_cpp_str()
+        code += f"\n  static constexpr bool kSFIsE4M3 = {str(self.sf_is_e4m3).lower()};"
+        if include_class_name:
+            code = f"class MmaOpClass {{\n{code}\n}};"
+        return code
 
     def generate_ptx(self, indent=0):
         return ""
@@ -489,10 +500,31 @@ class MmaOpClass:
         if mma_type == MmaType.MMA:
             return MmaOpClassImpl(m, n, k, a_dtype, b_dtype, cd_dtype)
         elif mma_type == MmaType.UMMA:
-            assert m in (8, 16) and (n, k) == (8, 16)
-            assert a_dtype == b_dtype and a_dtype in (dtypes.bfloat16, dtypes.float16)
-            assert cd_dtype == dtypes.float32
-            return UmmaOpClassImpl(m, n, k, a_dtype, b_dtype, cd_dtype)
+            assert m in (8, 16) and (n, k) == (8, 256 // a_dtype.num_bits)
+            assert a_dtype in (
+                dtypes.int8,
+                dtypes.bfloat16,
+                dtypes.float16,
+                dtypes.float8e4m3,
+                dtypes.float8e5m2,
+                dtypes.float8e3m4,
+                dtypes.float4e2m1,
+                dtypes.float4e0m3,
+            )
+            if a_dtype == dtypes.int8 or a_dtype.num_bits == 16:
+                assert a_dtype == b_dtype
+            else:
+                assert b_dtype in (
+                    dtypes.float8e4m3,
+                    dtypes.float8e5m2,
+                    dtypes.float8e3m4,
+                    dtypes.float4e2m1,
+                    dtypes.float4e0m3,
+                    dtypes.float6e3m2,
+                    dtypes.float6e2m3,
+                )
+            assert cd_dtype == (dtypes.int32 if a_dtype == dtypes.int8 else dtypes.float32)
+            return UmmaOpClassImpl(m, n, k, a_dtype, b_dtype, cd_dtype, sf_dtype)
         elif mma_type == MmaType.WGMMA:
             return WgmmaOpClassImpl(m, n, k, a_dtype, b_dtype, cd_dtype)
         elif mma_type == MmaType.MXMMA:

@@ -58,7 +58,11 @@ struct KernelContext : LayerConfig_, ComputeConfig_, TuningConfig_ {
   static constexpr bool kUseWgmma = LayerConfig::kMmaType == MmaType::WGMMA;
   static constexpr bool kUseMxmma = LayerConfig::kMmaType == MmaType::MXMMA;
 
+  static constexpr bool kUseBlockScaledMma = LayerConfig::kUseBlockScaledMma;
   static constexpr bool kUseUmmaSplitLoads = false;
+  static constexpr bool kUseUmmaSeparateInputScale = false;
+  static constexpr bool kUseUmmaAsyncActivationLoads = false;
+  static constexpr bool kUseUmmaCooperativeTma = false;
 
   static constexpr bool kUsePackedKLayout = LayerConfig::kUsePackedKLayout;
   static_assert(!kUsePackedKLayout || WarpShape::K == 128);
@@ -126,7 +130,7 @@ struct KernelContext : LayerConfig_, ComputeConfig_, TuningConfig_ {
 };
 
 
-// One physical WG visits the logical 128-channel partitions sequentially.
+// Output visits logical 128-channel partitions; dequantization can share a stage.
 template <class... ContextArgs>
 struct UmmaPipelineContext : KernelContext<ContextArgs...> {
   using Base = KernelContext<ContextArgs...>;
@@ -145,6 +149,15 @@ struct UmmaPipelineContext : KernelContext<ContextArgs...> {
   static constexpr bool kHasTmaWeightLoads = Base::kUseTmaB && kCanSplitWeightScaleLoad && kCanSplitZeroPointLoad;
   static constexpr bool kHasTmaActivationLoads = Base::kUseTmaA && kCanSplitInputScaleLoad;
   static constexpr bool kUseUmmaSplitLoads = kHasTmaActivationLoads && kHasTmaWeightLoads;
+  static constexpr bool kUseUmmaSeparateInputScale = Base::kUseUmmaSs && kUseUmmaSplitLoads;
+  static constexpr bool kUseUmmaAsyncActivationLoads = Base::kUseUmmaSs && !Base::kUseTmaA && kHasTmaWeightLoads;
+  // A cooperative completion is consumed by the issuer. Scale preparation must
+  // not need generic reads of B/BS in the other CTA before that completion.
+  static constexpr bool kCanPrepareScalesBeforeWeights =
+      !Base::kUseBlockScaledMma || !Base::kIsGroupWeightScale || Base::SharedStorage::kUseUmmaDirectWeightScale;
+  static constexpr bool kUseUmmaCooperativeTma = (kUseUmmaSeparateInputScale || kUseUmmaAsyncActivationLoads) &&
+                                                 Base::kUmmaCtaGroupSize == 2 && kCanPrepareScalesBeforeWeights && !Base::kHasZeroPoint &&
+                                                 Base::kMultiCastSizeA == 1 && Base::kMultiCastSizeB == 1;
   static constexpr uint32_t kLoadThreadOffset = 0;
   static constexpr uint32_t kNumLoadThreads = TuningConfig::kNumLoadThreads;
   static constexpr uint32_t kNumMathThreads = 128;
@@ -163,6 +176,7 @@ struct UmmaPipelineContext : KernelContext<ContextArgs...> {
   CUDA_INLINE bool is_math_thread() { return threadIdx.x >= 128 && threadIdx.x < 256; }
 
   CUDA_INLINE bool is_dequant_thread() { return threadIdx.x >= 256; }
+  CUDA_INLINE uint32_t dequant_group_id() { return (threadIdx.x - 256) / 128; }
 
   CUDA_INLINE bool is_issuer_thread() { return threadIdx.x >= kNumLoadThreads && threadIdx.x < kNumLoadThreads + 32; }
 
@@ -170,9 +184,10 @@ struct UmmaPipelineContext : KernelContext<ContextArgs...> {
     if constexpr (TuningConfig::kNumCtasPerSm > 2) {
       // A dynamic barrier ID reserves all named barriers, limiting residency to two CTAs.
       if (threadIdx.x < 256) sync_part_threads<128, Base::kNumThreads, 1>();
-      else sync_part_threads<128, Base::kNumThreads, 3>();
+      else if (threadIdx.x < 384) sync_part_threads<128, Base::kNumThreads, 3>();
+      else sync_part_threads<128, Base::kNumThreads, 4>();
     } else {
-      uint32_t barrier_id = threadIdx.x < 256 ? 1 : 3;
+      uint32_t barrier_id = threadIdx.x < 256 ? 1 : (threadIdx.x < 384 ? 3 : 4);
       asm volatile("bar.sync %0, 128;" ::"r"(barrier_id) : "memory");
     }
   }

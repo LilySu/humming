@@ -5,6 +5,11 @@
 #include "./utils.h"
 #include <cuda.h>
 
+inline bool uses_block_scaled_mma(const KernelData &kernel_data) {
+  bool is_low_bit_umma = kernel_data.mma_type_id == 2 && get_dtype_num_bits(kernel_data.a_dtype_id) <= 8;
+  return kernel_data.mma_type_id == 3 || is_low_bit_umma;
+}
+
 inline Tensor may_make_tensor_c(std::optional<Tensor> &c, const Tensor &a, KernelData &kernel_data, int64_t top_k) {
   if (c.has_value()) return c.value();
 
@@ -85,8 +90,15 @@ inline void check_tensor_b(Tensor &tensor, KernelData &kernel_data, int64_t dev)
 
   std::vector<int64_t> expected_shape = {};
   if (kernel_data.gemm_type_id != 0) expected_shape.push_back(kernel_data.num_experts);
-  expected_shape.push_back(problem_shape_k / pack_size_k);
-  expected_shape.push_back(problem_shape_n * pack_size_k * num_bits / 32);
+  if (kernel_data.use_umma_ss) {
+    if (get_dtype_num_bits(kernel_data.a_dtype_id) == 8 && num_bits < 8)
+      problem_shape_k = CEIL_DIV(problem_shape_k, 128) * 128;
+    expected_shape.push_back(problem_shape_n);
+    expected_shape.push_back(problem_shape_k * num_bits / 32);
+  } else {
+    expected_shape.push_back(problem_shape_k / pack_size_k);
+    expected_shape.push_back(problem_shape_n * pack_size_k * num_bits / 32);
+  }
   check_tensor_common(tensor, "b", dev, ScalarType::Int, expected_shape);
 };
 
@@ -109,7 +121,7 @@ inline void check_tensor_as(std::optional<Tensor> &tensor, KernelData &kernel_da
   uint32_t num_groups = group_size == 0 ? 1 : CEIL_DIV(problem_shape_k, group_size);
   constexpr int64_t input_scale_m_alignment = 4;
   int64_t m_pad = (shape_m + input_scale_m_alignment - 1) / input_scale_m_alignment * input_scale_m_alignment;
-  if (kernel_data.mma_type_id == 3 && group_size > 0) {
+  if (uses_block_scaled_mma(kernel_data) && group_size > 0) {
     std::vector<int64_t> expected_shape;
     if (kernel_data.use_tma_as || kernel_data.use_m_major_input_scale) {
       expected_shape = {(int64_t)CEIL_DIV(num_groups, 4), m_pad};
@@ -167,12 +179,17 @@ inline void check_tensor_bs(Tensor &tensor, KernelData &kernel_data, int64_t dev
   std::vector<int64_t> expected_shape = {};
   auto expected_dtype = dtype_id_to_tensor_dtype(kernel_data.bs_dtype_id);
   if (kernel_data.gemm_type_id != 0) expected_shape.push_back(kernel_data.num_experts);
-  if (kernel_data.mma_type_id == 3 && group_size > 0) {
+  if (uses_block_scaled_mma(kernel_data) && group_size > 0) {
     expected_dtype = ScalarType::Int;
     uint32_t num_bits = get_dtype_num_bits(kernel_data.a_dtype_id);
     uint32_t scale_vec = 256 / num_bits / group_size;
-    expected_shape.push_back(num_groups / (scale_vec == 1 ? 2 : 4));
-    expected_shape.push_back(kernel_data.problem_shape_n / (scale_vec == 1 ? 2 : 1));
+    if (kernel_data.mma_type_id == 2) {
+      expected_shape.push_back(CEIL_DIV(num_groups, 4));
+      expected_shape.push_back(CEIL_DIV(problem_shape_n, 128) * 128);
+    } else {
+      expected_shape.push_back(num_groups / (scale_vec == 1 ? 2 : 4));
+      expected_shape.push_back(problem_shape_n / (scale_vec == 1 ? 2 : 1));
+    }
   } else {
     expected_shape.push_back(num_groups);
     if (kernel_data.is_block_weight_scale) {
@@ -310,7 +327,7 @@ inline CUtensorMap make_tma_desc_as(std::optional<Tensor> &tensor_, KernelData &
   uint32_t num_groups = group_size == 0 ? 1 : CEIL_DIV(block_shape_k, group_size);
 
   auto tensor = tensor_.value();
-  if (kernel_data.mma_type_id == 3 && group_size > 0) {
+  if (uses_block_scaled_mma(kernel_data) && group_size > 0) {
     tensor = torch_view_shape(tensor, {-1, tensor.size(-1)});
     return make_tma_desc(tensor, {block_shape_m, CEIL_DIV(num_groups, 4)}, 0, "as");
   }
@@ -339,6 +356,28 @@ inline CUtensorMap make_tma_desc_b(Tensor &tensor, KernelData &kernel_data) {
   uint32_t num_bits = get_dtype_num_bits(kernel_data.b_dtype_id);
   uint32_t block_shape_n = kernel_data.block_shape_n;
   uint32_t block_shape_k = kernel_data.block_shape_k;
+
+  if (kernel_data.use_umma_ss) {
+    // FP4/FP6 in an f8f6f4 instruction uses padded 16-element blocks in SMEM.
+    bool expand_low_bit = num_bits < 8 && get_dtype_num_bits(kernel_data.a_dtype_id) == 8;
+    uint32_t smem_bits = expand_low_bit ? 8 : num_bits;
+    uint32_t swizzle_bytes = expand_low_bit ? 128 : std::min(128u, block_shape_k * smem_bits / 8);
+    if (expand_low_bit) {
+      CUtensorMap descriptor{};
+      uint64_t dimensions[] = {uint64_t(tensor.size(-1)) * 32 / num_bits, uint64_t(kernel_data.problem_shape_n) * std::max(1u, kernel_data.num_experts)};
+      uint64_t strides[] = {uint64_t(tensor.size(-1)) * 4};
+      uint32_t box[] = {swizzle_bytes, std::min(256u, std::max(128u, block_shape_n))};
+      uint32_t element_strides[] = {1, 1};
+      CUresult status = cuTensorMapEncodeTiled(
+          &descriptor, num_bits == 4 ? CU_TENSOR_MAP_DATA_TYPE_16U4_ALIGN16B : CU_TENSOR_MAP_DATA_TYPE_16U6_ALIGN16B, 2, tensor.data_ptr(),
+          dimensions, strides, box, element_strides, CU_TENSOR_MAP_INTERLEAVE_NONE,
+          get_swizzle_enum(swizzle_bytes), CU_TENSOR_MAP_L2_PROMOTION_NONE, CU_TENSOR_MAP_FLOAT_OOB_FILL_NONE);
+      ASSERT_CHECK(status == CUDA_SUCCESS, "TMA Encode Failed for expanded low-bit weights");
+      return descriptor;
+    }
+    auto rows = torch_view_shape(tensor, {-1, tensor.size(-1)});
+    return make_tma_desc(rows, {swizzle_bytes / 4, std::min(256u, std::max(128u, block_shape_n))}, swizzle_bytes, "b");
+  }
 
   uint32_t pack_size_k = 256 / get_dtype_num_bits(kernel_data.a_dtype_id);
   if (kernel_data.use_packed_k_layout) pack_size_k = 64;
@@ -370,11 +409,15 @@ inline CUtensorMap make_tma_desc_bs(Tensor tensor, KernelData &kernel_data) {
 
   tensor = torch_view_shape(tensor, {-1, tensor.size(-1)});
 
-  if (kernel_data.mma_type_id == 3 && kernel_data.is_group_weight_scale) {
+  if (uses_block_scaled_mma(kernel_data) && kernel_data.is_group_weight_scale) {
     uint32_t num_bits = get_dtype_num_bits(kernel_data.a_dtype_id);
     uint32_t scale_vec = 256 / num_bits / group_size;
     uint32_t packed_block_n = block_shape_n / (scale_vec == 1 ? 2 : 1);
     uint32_t packed_num_groups = num_groups / (scale_vec == 1 ? 2 : 4);
+    if (kernel_data.mma_type_id == 2) {
+      packed_block_n = std::max(block_shape_n, 128u);
+      packed_num_groups = CEIL_DIV(num_groups, 4);
+    }
     if (packed_block_n > 256) {
       ASSERT_CHECK(packed_block_n % 256 == 0, "MXMMA BS TMA width must be divisible by 256");
       ASSERT_CHECK(tensor.size(-1) % 256 == 0, "MXMMA packed BS width must be divisible by 256");

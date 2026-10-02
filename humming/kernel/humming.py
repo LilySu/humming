@@ -31,6 +31,9 @@ CODE_TEMPLATE = jinja2.Template("""
 {{tuning_config_macro}}
 
 #define HUMMING_USE_UMMA_PIPELINE {{use_umma_pipeline | int}}
+#define HUMMING_BLOCK_SHAPE_M {{block_shape[0]}}
+#define HUMMING_BLOCK_SHAPE_N {{block_shape[1]}}
+#define HUMMING_BLOCK_SHAPE_K {{block_shape[2]}}
 
 {% if use_umma_pipeline %}
 #include <humming/kernel/humming_umma.cuh>
@@ -120,23 +123,15 @@ class HummingKernel(KernelRuntime, LayerConfig, ComputeConfig, TuningConfig):
             self.use_mbarrier = True
         TuningConfig.__post_init__(self)
         if self.use_umma_pipeline:
-            self.num_threads = 384
+            self.num_threads = 256 if self.use_umma_ss else 256 + 128 * self.umma_num_dequant_warpgroups
             self.num_math_threads = 128
             activation_bytes = self.block_shape[0] * self.block_shape[2] * self.a_dtype.num_bits // 8
             # Wider cp.async tiles benefit from a third loading warp. Keep the
             # readiness warp for small tiles and independently loaded TMA operands.
             use_wide_async_load = not self.use_tma_a and activation_bytes >= 12 * 1024
+            use_wide_async_load &= not self.use_umma_ss
             self.num_load_threads = 96 if use_wide_async_load else 64
         KernelRuntime.__post_init__(self)
-
-    def init_sm_version(self):
-        super().init_sm_version()
-        if self.mma_type == MmaType.UMMA:
-            assert self.sm_version // 10 == 10, "UMMA requires SM100 family"
-            assert _cuda_compiler_version(self._get_compiler()) >= (12, 9), (
-                "UMMA sm_100f requires CUDA 12.9 or newer"
-            )
-            self.sm_version_str = "100f"
 
     def init_kernel(self) -> None:
         self.check_shape()
@@ -212,6 +207,8 @@ class HummingKernel(KernelRuntime, LayerConfig, ComputeConfig, TuningConfig):
         return module.get_kernel_id
 
     def postprocess_cubin(self, cubin_path: str):
+        if self.mma_type == MmaType.UMMA:
+            return  # UMMA encodes operand formats directly in its descriptor.
         mode = ""
         if dtypes.float8e3m4 in (self.mma_a_dtype, self.mma_b_dtype):
             if self.mma_a_dtype != dtypes.float8e3m4:
@@ -312,7 +309,18 @@ class HummingKernel(KernelRuntime, LayerConfig, ComputeConfig, TuningConfig):
             and self.a_dtype in (dtypes.float8e4m3, dtypes.float8e5m2, dtypes.float8e3m4)
             and self.b_dtype in (dtypes.float4e2m1, dtypes.float6e3m2, dtypes.float6e2m3)
         )
-        self.mma_b_dtype = self.b_dtype if mma_native_mixed else self.a_dtype
+        umma_native_mixed = (
+            self.mma_type == MmaType.UMMA
+            and self.a_dtype.num_bits <= 8
+            and self.b_dtype.is_floating_point_type
+        )
+        self.mma_b_dtype = self.b_dtype if mma_native_mixed or umma_native_mixed else self.a_dtype
+
+        scale_dtype = dtypes.float8e8m0
+        if self.is_group_input_scale:
+            scale_dtype = self.as_dtype
+        elif self.is_group_weight_scale:
+            scale_dtype = self.bs_dtype
 
         return MmaOpClass.from_config(
             self.mma_type,
@@ -322,6 +330,7 @@ class HummingKernel(KernelRuntime, LayerConfig, ComputeConfig, TuningConfig):
             self.mma_a_dtype,
             self.mma_b_dtype,
             mma_cd_dtype,
+            sf_dtype=scale_dtype,
         )
 
     def check_shape(self):
@@ -359,7 +368,7 @@ class HummingKernel(KernelRuntime, LayerConfig, ComputeConfig, TuningConfig):
             assert self.warp_shape[2] >= 128
 
     def check_scale(self):
-        if self.mma_type == MmaType.MXMMA:
+        if self.use_block_scaled_mma:
             mma_k = 256 // self.a_dtype.num_bits
             for gs in (self.input_scale_group_size, self.weight_scale_group_size):
                 if gs > 0:
@@ -393,9 +402,9 @@ class HummingKernel(KernelRuntime, LayerConfig, ComputeConfig, TuningConfig):
         dtype_map = {
             dtypes.int4: 80,
             dtypes.int8: 75,
-            dtypes.float4e0m3: 120,
-            dtypes.float4e2m1: 120,
-            dtypes.float8e3m4: 120,
+            dtypes.float4e0m3: 100 if self.mma_type == MmaType.UMMA else 120,
+            dtypes.float4e2m1: 100 if self.mma_type == MmaType.UMMA else 120,
+            dtypes.float8e3m4: 100 if self.mma_type == MmaType.UMMA else 120,
             dtypes.float8e4m3: 89,
             dtypes.float8e5m2: 89,
             dtypes.bfloat16: 80,
@@ -415,15 +424,19 @@ class HummingKernel(KernelRuntime, LayerConfig, ComputeConfig, TuningConfig):
                 assert not self.b_dtype.is_signed
         elif self.b_dtype.is_integer_type and self.a_dtype.is_floating_point_type:
             assert not self.b_dtype.is_signed
+            assert self.b_dtype.num_bits < self.a_dtype.num_bits
             if self.has_zero_point:
                 assert self.b_dtype.num_bits <= self.a_dtype.mantissa_bits + 1
             else:
                 assert self.b_dtype.num_bits <= self.a_dtype.mantissa_bits + 2
         elif self.b_dtype.is_floating_point_type and self.a_dtype.is_floating_point_type:
             assert self.b_dtype.is_signed
-            assert self.b_dtype.exponent_bits <= self.a_dtype.exponent_bits
-            assert self.b_dtype.mantissa_bits <= self.a_dtype.mantissa_bits
-            assert self.a_dtype.exponent_bits == 0 or self.b_dtype.exponent_bits >= 1
+            uses_native_umma = self.mma_type == MmaType.UMMA and self.a_dtype.num_bits <= 8
+            if not self.use_block_scaled_mma and not uses_native_umma:
+                assert self.b_dtype.exponent_bits <= self.a_dtype.exponent_bits
+                assert self.b_dtype.mantissa_bits <= self.a_dtype.mantissa_bits
+            if not uses_native_umma:
+                assert self.a_dtype.exponent_bits == 0 or self.b_dtype.exponent_bits >= 1
         elif self.b_dtype.is_floating_point_type and self.a_dtype.is_integer_type:
             assert self.use_fused_e8m0_scale
 
@@ -446,13 +459,70 @@ class HummingKernel(KernelRuntime, LayerConfig, ComputeConfig, TuningConfig):
             assert self.umma_cta_group_size == 1 and self.umma_output_chunk_rows == 0, (
                 "UMMA cooperative execution and chunked output require mma_type=umma"
             )
+        if self.use_umma_ss:
+            assert self.use_tma_b, "SS weight operands require TMA loading"
         if self.mma_type == MmaType.UMMA:
+            assert self.umma_num_dequant_warpgroups in (1, 2)
+            assert self.a_dtype in (
+                dtypes.int8,
+                dtypes.bfloat16,
+                dtypes.float16,
+                dtypes.float8e4m3,
+                dtypes.float8e5m2,
+                dtypes.float8e3m4,
+                dtypes.float4e2m1,
+                dtypes.float4e0m3,
+            )
+            if self.a_dtype == dtypes.int8:
+                assert self.sm_version in (100, 110), "INT8 UMMA requires SM100/110; use MMA on SM103/107"
+                assert self.b_dtype.is_integer_type
+                has_group_scales = self.is_group_input_scale or self.is_group_weight_scale
+                has_group_scales |= self.is_block_weight_scale
+                assert not has_group_scales, "INT8 UMMA requires scales applied after accumulation"
+                block_m = self.block_shape[0]
+                assert block_m <= 32 or block_m % 16 == 0, "INT8 UMMA requires M divisible by 16 above M=32"
+            elif self.a_dtype.num_bits == 8:
+                assert self.b_dtype.is_integer_type or self.b_dtype in (
+                    dtypes.float8e4m3,
+                    dtypes.float8e5m2,
+                    dtypes.float8e3m4,
+                    dtypes.float4e2m1,
+                    dtypes.float6e3m2,
+                    dtypes.float6e2m3,
+                )
+                assert not self.is_block_weight_scale and not self.has_zero_point
+                if self.use_block_scaled_mma:
+                    for group_size, scale_dtype in (
+                        (self.input_scale_group_size, self.as_dtype),
+                        (self.weight_scale_group_size, self.bs_dtype),
+                    ):
+                        if group_size:
+                            assert group_size == 32 and scale_dtype == dtypes.float8e8m0, (
+                                "mxf8f6f4 requires E8M0 scales with group size 32"
+                            )
+            if self.a_dtype.num_bits == 4:
+                assert not self.is_block_weight_scale and not self.has_zero_point
+                assert self.b_dtype.is_integer_type or self.b_dtype in (dtypes.float4e2m1, dtypes.float4e0m3)
+                assert self.use_block_scaled_mma
+                for group_size, scale_dtype in (
+                    (self.input_scale_group_size, self.as_dtype),
+                    (self.weight_scale_group_size, self.bs_dtype),
+                ):
+                    if group_size:
+                        assert (group_size, scale_dtype) in (
+                            (32, dtypes.float8e8m0),
+                            (16, dtypes.float8e8m0),
+                            (16, dtypes.float8e4m3),
+                        ), "FP4 UMMA requires group-32 E8M0 or group-16 E8M0/E4M3 scales"
             block_m, block_n, block_k = self.block_shape
             warp_m, warp_n, warp_k = self.warp_shape
             assert block_m == warp_m, "UMMA requires block M to equal warp M"
             assert block_k == warp_k, "UMMA requires block K to equal warp K"
             assert block_n in (128, 256, 512), "UMMA requires block N in (128, 256, 512)"
             assert warp_n == 32
+            assert block_k * self.a_dtype.num_bits >= 512, (
+                "UMMA requires at least 64 bytes per activation row"
+            )
             assert self.num_write_splits == 1, "UMMA requires num_write_splits == 1"
             assert self.num_stages >= 2
             assert self.multi_cast_size_a == self.multi_cast_size_b == 1
@@ -506,7 +576,8 @@ class HummingKernel(KernelRuntime, LayerConfig, ComputeConfig, TuningConfig):
         if self.is_grouped_gemm and self.block_shape[0] + 4 > 256:
             self.use_tma_as = False
             self.use_tma_as2 = False
-        if not self.has_input_scale_2 or self.is_tensor_input_scale_2:
+        # UMMA preloads secondary scales directly into epilogue registers.
+        if self.mma_type == MmaType.UMMA or not self.has_input_scale_2 or self.is_tensor_input_scale_2:
             self.use_tma_as2 = False
 
         if self.is_indexed_gemm:
@@ -516,7 +587,7 @@ class HummingKernel(KernelRuntime, LayerConfig, ComputeConfig, TuningConfig):
             assert not self.use_tma_as2, "indexed GEMM does not support TMA secondary input scale loads"
 
         if self.multi_cast_size_a * self.multi_cast_size_b > 1:
-            assert self.sm_version in (90, 100, 103)
+            assert self.sm_version == 90 or self.sm_version // 10 in (10, 11)
 
         if self.use_tma_as:
             assert self.use_m_major_input_scale, "use_tma_as requires use_m_major_input_scale=True"

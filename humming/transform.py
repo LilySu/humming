@@ -250,6 +250,7 @@ def transform_humming_weight(
     interleave_mode: int = 3,
     use_packed_k_layout: bool = False,
     use_native_dequant: bool = False,
+    use_signed_s4_kmajor_layout: bool = False,
     use_umma_ss: bool = False,
 ) -> torch.Tensor:
     is_moe = weight.ndim == 3
@@ -351,6 +352,7 @@ def transform_humming_weight(
         group_size_zp=group_size_zp,
         use_packed_k_layout=use_packed_k_layout,
         use_native_dequant=use_native_dequant,
+        use_signed_s4_kmajor_layout=use_signed_s4_kmajor_layout,
     )
     return repacked_weight if is_moe else repacked_weight.squeeze(0)
 
@@ -500,6 +502,7 @@ def transform_humming_tensors(
         interleave_mode=interleave_mode,
         use_packed_k_layout=config.use_packed_k_layout,
         use_native_dequant=config.use_native_dequant,
+        use_signed_s4_kmajor_layout=config.use_signed_s4_kmajor_layout,
         use_umma_ss=config.use_umma_ss,
     )
 

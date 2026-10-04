@@ -27,6 +27,12 @@ def _cuda_compiler_version(compiler_cls):
     return tuple(int(x) for x in version.split(".")[:2])
 
 
+def _is_signed_s4_compiler_available() -> bool:
+    from humming.jit.runtime import KernelRuntime
+
+    return _cuda_compiler_version(KernelRuntime._get_compiler()) >= (13, 4)
+
+
 @dataclasses.dataclass(kw_only=True, unsafe_hash=True)
 class LayerConfig(BaseHummingConfig):
     sm_version: int | None = None
@@ -88,7 +94,11 @@ class LayerConfig(BaseHummingConfig):
         "use_native_dequant",
         "use_block_scaled_mma",
         "mma_scale_group_size",
+        "use_signed_s4_kmajor_layout",
     )
+    _name_map: ClassVar[dict[str, str]] = {
+        "use_signed_s4_kmajor_layout": "kUseSignedS4KMajorLayout",
+    }
 
     @property
     def use_block_scaled_mma(self):
@@ -136,6 +146,18 @@ class LayerConfig(BaseHummingConfig):
             )
 
         return self.b_dtype in accepted_b_dtype
+
+    @property
+    def use_signed_s4_kmajor_layout(self):
+        can_use_signed_s4_layout = (
+            self.a_dtype == dtypes.int8
+            and self.b_dtype == dtypes.uint4
+            and self.use_packed_k_layout
+            and not self.has_zero_point
+            and not self.is_fp_zero_point
+            and self.sm_version == 90
+        )
+        return can_use_signed_s4_layout and _is_signed_s4_compiler_available()
 
     @property
     def mxmma_supported(self):

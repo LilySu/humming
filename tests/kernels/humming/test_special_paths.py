@@ -8,6 +8,8 @@ import humming.testing.runner as runner_module
 from humming import dtypes
 from humming.config import ComputeConfig, GemmType, LayerConfig, MmaType, WeightScale2Type
 from humming.forward import humming_forward
+from humming.jit.runtime import KernelRuntime
+from humming.kernel.humming import HummingKernel
 from humming.testing import (
     KernelTestCase,
     KernelTestRunner,
@@ -24,6 +26,7 @@ SPECIAL_FEATURES = {
     "use_int_weight_scale",
     "use_fused_e8m0_scale",
     "use_packed_k_layout",
+    "use_signed_s4_kmajor_layout",
 }
 
 
@@ -170,6 +173,30 @@ SPECIAL_WEIGHT_CASES = (
             mma_type=MmaType.WGMMA,
         ),
     ),
+    _kernel_case(
+        required_features=("use_packed_k_layout",),
+        name="packed-k-w4a8",
+        layer_config=_layer_config(
+            a_dtype=dtypes.int8,
+            b_dtype=dtypes.uint4,
+            bs_dtype=dtypes.bfloat16,
+            weight_scale_group_size=128,
+            has_zero_point=False,
+            mma_type=MmaType.WGMMA,
+        ),
+    ),
+    _kernel_case(
+        required_features=("use_packed_k_layout", "use_signed_s4_kmajor_layout"),
+        name="signed-s4-w4a8",
+        layer_config=_layer_config(
+            a_dtype=dtypes.int8,
+            b_dtype=dtypes.uint4,
+            bs_dtype=dtypes.bfloat16,
+            weight_scale_group_size=128,
+            has_zero_point=False,
+            mma_type=MmaType.WGMMA,
+        ),
+    ),
     *(
         _kernel_case(
             required_features=("use_packed_k_layout", "use_fused_e8m0_scale"),
@@ -239,6 +266,94 @@ def test_forward_fullgraph():
     assert counter.frame_count == 1
 
 
+def test_signed_s4_cuda_graph():
+    skip_if_unsupported(a_dtype=dtypes.int8, mma_type="wgmma", use_signed_s4=True)
+    config = _layer_config(
+        a_dtype=dtypes.int8,
+        b_dtype=dtypes.uint4,
+        bs_dtype=dtypes.bfloat16,
+        weight_scale_group_size=128,
+        mma_type=MmaType.WGMMA,
+    )
+    assert config.use_signed_s4_kmajor_layout is True
+    test_case = KernelTestCase(
+        name="signed-s4-cuda-graph",
+        layer_config=config,
+        compute_config=ComputeConfig(gemm_type=GemmType.DENSE),
+    )
+    runner = KernelTestRunner(test_case)
+    compute_config = runner.compute_config.to_str()
+
+    def quantize_random_inputs():
+        inputs_orig = generate_random_tensor((64, SHAPE_K), dtype=config.param_dtype, device="cuda")
+        inputs_ref, inputs, input_scale, _ = runner.prepare_inputs(inputs_orig)
+        return inputs_ref, inputs, input_scale
+
+    _, inputs, input_scale = quantize_random_inputs()
+    outputs = torch.empty(64, SHAPE_N, device="cuda", dtype=torch.bfloat16)
+    locks = torch.zeros(1024, device="cuda", dtype=torch.int32)
+
+    def forward():
+        humming_forward(
+            config,
+            inputs,
+            **runner.kernel_tensors,
+            outputs=outputs,
+            input_scale=input_scale,
+            locks=locks,
+            compute_config=compute_config,
+            tuning_config={},
+        )
+
+    forward()
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        forward()
+    for _ in range(3):
+        inputs_ref, new_inputs, new_input_scale = quantize_random_inputs()
+        inputs.copy_(new_inputs)
+        input_scale.copy_(new_input_scale)
+        outputs.fill_(-123)
+        graph.replay()
+        expected = runner.make_reference(inputs_ref, None, None)
+        torch.testing.assert_close(outputs, expected, rtol=test_case.rtol, atol=test_case.atol)
+
+
+def test_signed_s4_compiler_floor(monkeypatch):
+    # The remaining limitation: compilers < CUDA 13.4 must fall back to the
+    # packed-K loader, silently and correctly.
+    import humming.config.config as config_module
+
+    monkeypatch.setattr(config_module, "_is_signed_s4_compiler_available", lambda: False)
+    # Load-bearing: the config string is field-only, so patched and
+    # unpatched configs share a cache key — without these clears a native
+    # kernel from earlier in the session would be served verbatim.
+    monkeypatch.setattr(KernelRuntime, "_instances", {})
+    monkeypatch.setattr(HummingKernel, "_str2kernel_cache", {})
+
+    test_case = next(case for _, case in SPECIAL_WEIGHT_CASES if case.name == "packed-k-w4a8")
+    assert test_case.layer_config.use_packed_k_layout is True
+    assert test_case.layer_config.use_signed_s4_kmajor_layout is False
+
+    skip_if_unsupported(a_dtype=dtypes.int8, mma_type="wgmma")
+    results = KernelTestRunner(test_case).run()
+    assert_kernel_test_shape_coverage(results)
+
+
+@pytest.mark.parametrize("compiler", ("nvcc", "nvrtc"))
+def test_signed_s4_w4a8_compilers(compiler, monkeypatch):
+    monkeypatch.setenv("HUMMING_COMPILER", compiler)
+    # Compilers select kernels independently; drop caches shared across them.
+    monkeypatch.setattr(KernelRuntime, "_instances", {})
+    monkeypatch.setattr(HummingKernel, "_str2kernel_cache", {})
+
+    skip_if_unsupported(a_dtype=dtypes.int8, mma_type="wgmma", use_signed_s4=True)
+    test_case = next(case for _, case in SPECIAL_WEIGHT_CASES if case.name == "signed-s4-w4a8")
+    assert test_case.layer_config.use_signed_s4_kmajor_layout is True
+    results = KernelTestRunner(test_case).run()
+    assert_kernel_test_shape_coverage(results)
+
+
 @pytest.mark.parametrize(
     "required_features,test_case",
     SPECIAL_WEIGHT_CASES,
@@ -248,13 +363,13 @@ def test_special_weight_path(required_features, test_case):
     config = test_case.layer_config
     if "use_fused_e8m0_scale" in required_features and config.mma_type == MmaType.MXMMA:
         pytest.skip("fused E8M0 scale is not supported by MXMMA")
-
+    use_signed_s4 = "use_signed_s4_kmajor_layout" in required_features
+    skip_if_unsupported(a_dtype=config.a_dtype, mma_type=config.mma_type.value, use_signed_s4=use_signed_s4)
     for feature in required_features:
         assert getattr(config, feature) is True
     if "use_int_weight_scale" in required_features or "use_fused_e8m0_scale" in required_features:
         assert config.weight_scale_2_type != WeightScale2Type.NONE
 
-    skip_if_unsupported(a_dtype=config.a_dtype, mma_type=config.mma_type.value)
     results = KernelTestRunner(test_case).run()
     assert_kernel_test_shape_coverage(results)
 
@@ -278,6 +393,20 @@ def test_special_weight_path_coverage():
     odd_bit_fallback = next(case.layer_config for _, case in SPECIAL_WEIGHT_CASES if "odd-bit" in case.name)
     assert odd_bit_fallback.b_dtype.num_bits % 2 == 1
     assert odd_bit_fallback.use_packed_k_layout is False
+
+    signed_s4_configs = configs_by_feature["use_signed_s4_kmajor_layout"]
+    assert all(
+        config.a_dtype == dtypes.int8 and config.b_dtype == dtypes.uint4 for config in signed_s4_configs
+    )
+    ineligible_names = (
+        "nvfp4-a16-dense",
+        "packed-k-fp8-grouped-input",
+        "packed-k-zero-point",
+        "odd-bit-packed-k-fallback",
+    )
+    for name in ineligible_names:
+        ineligible_config = next(case.layer_config for _, case in SPECIAL_WEIGHT_CASES if case.name == name)
+        assert ineligible_config.use_signed_s4_kmajor_layout is False
 
 
 @pytest.mark.parametrize(

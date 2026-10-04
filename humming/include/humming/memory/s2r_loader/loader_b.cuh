@@ -1,6 +1,7 @@
 #pragma once
 
 #include <humming/utils/all.cuh>
+#include <humming/utils/ptx/ldmatrix_s4.cuh>
 
 
 template <class Ctx>
@@ -62,7 +63,43 @@ public:
   }
 
   CUDA_INLINE
+  void load_ldmatrix_s4(const int4 *smem_ptr, uint32_t *regs_ptr, uint32_t iter_id) {
+    static_assert(Ctx::kPartMmaShapeK == 32);
+    static_assert(ElementA::kBits == 8);
+    static_assert(Ctx::kUseWgmma);
+    static_assert(WarpShape::K % 64 == 0, "load_ldmatrix_s4 requires WarpShape::K a multiple of 64");
+    static_assert(!Ctx::kUseSignedS4KMajorLayout || kLdmatrixS4Ptx94Available,
+                  "signed-S4 K-major layout requires CUDA 13.4+ (PTX ISA 9.4)");
+
+    constexpr uint32_t kNumKChunks = WarpShape::K / 64;
+    constexpr uint32_t kPlaneBytes = kSmemStride * sizeof(int4);   // one 64-K plane
+    static_assert(kPlaneBytes * (BlockShape::K / 64) == sizeof(Ctx::SharedStorage::StageStorage::b),
+                  "S4 planes must exactly fill the B stage buffer");
+
+    uint32_t lane_id = ctx.lane_id();
+    uint32_t matrix_idx = lane_id / 8;
+    uint32_t row_in_matrix = lane_id % 8;
+    uint32_t m_subgroup = matrix_idx % 2;
+    uint32_t k_half = matrix_idx / 2;
+    uint32_t m_base = ctx.n_warp_offset() + iter_id * 16;
+    uint32_t address_row = m_base + m_subgroup * 8 + row_in_matrix;
+
+    const uint8_t *smem_bytes = reinterpret_cast<const uint8_t *>(smem_ptr);
+    PRAGMA_UNROLL
+    for (uint32_t kc = 0; kc < kNumKChunks; kc++) {
+      uint32_t plane_id = ctx.k_warp_id() * kNumKChunks + kc;
+      const uint8_t *plane = smem_bytes + plane_id * kPlaneBytes;
+      PRAGMA_UNROLL
+      for (uint32_t slab = 0; slab < 2; slab++) {
+        uint32_t slab_byte_offset = slab * 16 + k_half * 8;
+        ld_shared_s4x4(&plane[address_row * 32 + slab_byte_offset], &regs_ptr[kc * 8 + slab * 4]);
+      }
+    }
+  }
+
+  CUDA_INLINE
   void load(const int4 *smem_ptr, uint32_t *regs_ptr, uint32_t iter_id) {
+    if constexpr (Ctx::kUseSignedS4KMajorLayout) return load_ldmatrix_s4(smem_ptr, regs_ptr, iter_id);
     if constexpr (Ctx::kUsePackedKLayout) return load_packed_k(smem_ptr, regs_ptr, iter_id);
     uint32_t warp_id = ctx.warp_id();
     uint32_t n_warp_id = ctx.n_warp_id();

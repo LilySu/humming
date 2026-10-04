@@ -138,6 +138,36 @@ MOE_CASES = (
         input_scale_group_size=64,
         weight_scale_group_size=64,
     ),
+    _case(
+        "indexed-w4a8",
+        GemmType.INDEXED,
+        a_dtype=dtypes.int8,
+        weight_scale_group_size=128,
+        mma_type=MmaType.WGMMA,
+    ),
+    _case(
+        "grouped-contiguous-w4a8",
+        GemmType.GROUPED_CONTIGUOUS,
+        a_dtype=dtypes.int8,
+        weight_scale_group_size=128,
+        mma_type=MmaType.WGMMA,
+    ),
+    _case(
+        "grouped-masked-w4a8",
+        GemmType.GROUPED_MASKED,
+        a_dtype=dtypes.int8,
+        weight_scale_group_size=128,
+        mma_type=MmaType.WGMMA,
+    ),
+    # K=1408: odd group count and a partial 256-wide K tile per expert.
+    _case(
+        "grouped-contiguous-w4a8-partial-k",
+        GemmType.GROUPED_CONTIGUOUS,
+        a_dtype=dtypes.int8,
+        weight_scale_group_size=128,
+        mma_type=MmaType.WGMMA,
+        shape_k=1408,
+    ),
 )
 
 
@@ -146,7 +176,10 @@ def test_moe(test_case):
     config = test_case.layer_config
     assert config.num_experts == NUM_EXPERTS
     assert test_case.compute_config.gemm_type != GemmType.DENSE
-    skip_if_unsupported(a_dtype=config.a_dtype, mma_type=config.mma_type.value)
+    use_signed_s4 = "w4a8" in test_case.name
+    skip_if_unsupported(a_dtype=config.a_dtype, mma_type=config.mma_type.value, use_signed_s4=use_signed_s4)
+    if use_signed_s4:
+        assert config.use_signed_s4_kmajor_layout is True
     results = KernelTestRunner(test_case).run()
     if test_case.compute_config.gemm_type == GemmType.INDEXED:
         assert all(not result.tuning_config.use_tma_as for result in results)

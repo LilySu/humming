@@ -40,6 +40,7 @@ public:
   static constexpr uint32_t kNumWarpShapeNSplits = !Ctx::kUsePackedKLayout && WarpShape::N == ElementA::kBits * 2 ? 2 : 1;
 
   static constexpr bool kUsePackedKLayout = Ctx::kUsePackedKLayout;
+  static constexpr bool kUseSignedS4KMajorLayout = Ctx::kUseSignedS4KMajorLayout;
   static constexpr uint32_t kPackedKFactor = Ctx::kPackedKFactor;
   static constexpr uint32_t kWarpIters = Ctx::kWarpIters;
   static constexpr uint32_t kNumKSlabs = WarpShape::K / kPartMmaShapeK;
@@ -79,7 +80,7 @@ public:
 
   CUDA_INLINE
   void transform_b(uint32_t buffer_id, uint32_t iter_id) {
-    if constexpr (std::is_same<ElementA, ElementB>::value) return;
+    if constexpr (std::is_same<ElementA, ElementB>::value || kUseSignedS4KMajorLayout) return;
 
     if constexpr (kUseFusedE8m0Scale) {
       uint32_t *regs_b_ptr = reinterpret_cast<uint32_t *>(regs_b[buffer_id]);
@@ -208,7 +209,7 @@ public:
 
   template <class T = uint32_t>
   CUDA_INLINE T *regs_qb_as_ptr(uint32_t buffer_id) {
-    if constexpr (std::is_same<ElementA, ElementB>::value) {
+    if constexpr (std::is_same<ElementA, ElementB>::value || kUseSignedS4KMajorLayout) {
       return reinterpret_cast<T *>(regs_b[buffer_id]);
     } else {
       return reinterpret_cast<T *>(regs_qb[buffer_id]);

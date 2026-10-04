@@ -23,6 +23,7 @@ def skip_if_unsupported(
     use_tma=None,
     use_warp_spec=None,
     use_mbarrier=None,
+    use_signed_s4=None,
 ) -> None:
     """Skip a test whose hardware requirements aren't met by the current GPU."""
     import pytest
@@ -48,6 +49,14 @@ def skip_if_unsupported(
         compiler_version = _cuda_compiler_version(KernelRuntime._get_compiler())
         if compiler_version < (13, 1):
             pytest.skip("E0M3 MXMMA on SM121 requires CUDA 13.1 or newer (PTX ISA 9.1)")
+
+    if use_signed_s4:
+        from humming.config.config import _is_signed_s4_compiler_available
+
+        if sm != 90:
+            pytest.skip(f"signed-S4 ldmatrix.s8.s4 requires SM90, current SM is {sm}")
+        if not _is_signed_s4_compiler_available():
+            pytest.skip("signed-S4 ldmatrix.s8.s4 requires CUDA 13.4 or newer (PTX ISA 9.4)")
 
     if a_dtype is not None and a_dtype in _A_DTYPE_MIN_SM:
         min_sm = _A_DTYPE_MIN_SM[a_dtype]

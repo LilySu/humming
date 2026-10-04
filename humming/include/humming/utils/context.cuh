@@ -72,6 +72,8 @@ struct KernelContext : LayerConfig_, ComputeConfig_, TuningConfig_ {
       LayerConfig::kInputScaleGroupSize == 128 && ComputeConfig::kUseMMajorInputScale;
 
 
+  static constexpr bool kUseSignedS4KMajorLayout = LayerConfig::kUseSignedS4KMajorLayout;
+
   static constexpr uint32_t M_WARPS = BlockShape::M / WarpShape::M;
   static constexpr uint32_t N_WARPS = BlockShape::N / WarpShape::N;
   static constexpr uint32_t K_WARPS = BlockShape::K / WarpShape::K;

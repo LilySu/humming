@@ -28,6 +28,7 @@ class RepackWeightKernel(KernelRuntime):
     group_size_zp: int = 0
     use_packed_k_layout: bool = False
     use_native_dequant: bool = False
+    use_signed_s4_kmajor_layout: bool = False
 
     def init_kernel(self):
         if self.should_preprocess_with_zp:
@@ -56,7 +57,8 @@ class RepackWeightKernel(KernelRuntime):
             f"    {int(should_transpose_mini_block)},\n"
             f"    {self.group_size_zp},\n"
             f"    {int(self.use_packed_k_layout)},\n"
-            f"    {int(self.use_native_dequant)}>"
+            f"    {int(self.use_native_dequant)},\n"
+            f"    {int(self.use_signed_s4_kmajor_layout)}>"
         )
         self.arg_types = (
             ctypes.c_void_p,

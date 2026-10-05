@@ -1,5 +1,6 @@
 
 #include <humming/utils/all.cuh>
+#include <humming/utils/ptx/ldmatrix_s4.cuh>
 
 template <uint32_t kNumBitsB, uint32_t kNumBitsA, bool kUseNativeDequant>
 CUDA_INLINE void humming_pack_weight(uint32_t *in_arr, uint32_t *out_arr, uint32_t interleave_mode) {
@@ -189,9 +190,8 @@ __global__ void weight_repack_nk(
   __syncthreads();
 
   if constexpr (kUseSignedS4KMajorLayout) {
-    // K-major, gapless 64(N) x 64(K) tile of packed signed 4-bit weights.
-    // Store each uint4 nibble as v ^ 0x8 so signed-S4 interpretation
-    // is bit-exact with the existing v - 8 conversion.
+    // Gapless K-major packed S4 weights: store uint4 as v ^ 0x8, with row-wise XOR slot permutation
+    // so signed-S4 conversion is bit-exact and ldmatrix loads are bank-conflict-free.
     uint32_t packed_out_stride = 64 * padded_shape_n * kNumBitsB / 32;
     uint32_t packed_max_row = gridDim.z * padded_shape_k / 64;
     uint32_t out_row = (blockIdx.y * 64 + blockIdx.z * padded_shape_k) / 64;
@@ -214,7 +214,8 @@ __global__ void weight_repack_nk(
           uint8_t byte1 = static_cast<uint8_t>((v2 & mask) ^ 0x8) |
                           static_cast<uint8_t>(((v3 & mask) ^ 0x8) << 4);
           uint32_t global_n = blockIdx.x * 64 + n;
-          uint32_t byte_row_offset = global_n * 32 + k_base / 2;
+          uint32_t slot = signed_s4_slot(global_n, k_base / 16);
+          uint32_t byte_row_offset = global_n * 32 + slot * 8 + (k_base % 16) / 2;
           out_bytes[byte_row_offset + 0] = byte0;
           out_bytes[byte_row_offset + 1] = byte1;
         }

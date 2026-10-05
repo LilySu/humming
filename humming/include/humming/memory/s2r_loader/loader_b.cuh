@@ -68,6 +68,8 @@ public:
     static_assert(ElementA::kBits == 8);
     static_assert(Ctx::kUseWgmma);
     static_assert(WarpShape::K % 64 == 0, "load_ldmatrix_s4 requires WarpShape::K a multiple of 64");
+    static_assert(BlockShape::N % 16 == 0,
+      "signed-S4 slot swizzle assumes 16-row-aligned N tiles (tile row == global row mod 16)");
     static_assert(!Ctx::kUseSignedS4KMajorLayout || kLdmatrixS4Ptx94Available,
                   "signed-S4 K-major layout requires CUDA 13.4+ (PTX ISA 9.4)");
 
@@ -91,8 +93,10 @@ public:
       const uint8_t *plane = smem_bytes + plane_id * kPlaneBytes;
       PRAGMA_UNROLL
       for (uint32_t slab = 0; slab < 2; slab++) {
-        uint32_t slab_byte_offset = slab * 16 + k_half * 8;
-        ld_shared_s4x4(&plane[address_row * 32 + slab_byte_offset], &regs_ptr[kc * 8 + slab * 4]);
+        // Logical slot = slab*2 + k_half; physical slot after the per-row XOR
+        // (must match weight_repack_nk's signed-S4 branch).
+        uint32_t slot = signed_s4_slot(address_row, slab * 2 + k_half);
+        ld_shared_s4x4(&plane[address_row * 32 + slot * 8], &regs_ptr[kc * 8 + slab * 4]);
       }
     }
   }

@@ -11,6 +11,13 @@ constexpr bool kLdmatrixS4Ptx94Available =
     false;
 #endif
 
+// Signed-S4 K-major layout: each 64-wide K row is packed into four 8-byte slots,
+// with values stored as v ^ 0x8. Slots are row-wise XOR-permuted to eliminate
+// ldmatrix shared-memory bank conflicts; this helper is the single layout definition.
+CUDA_INLINE constexpr uint32_t signed_s4_slot(uint32_t row, uint32_t slot) {
+    return slot ^ ((row >> 2) & 3);
+  }
+
 // Loads four contiguous x4 subtiles into `regs`.
 // Guard call sites with `if constexpr` on supported targets.
 CUDA_INLINE void ld_shared_s4x4(const void* smem_ptr, uint32_t* regs) {

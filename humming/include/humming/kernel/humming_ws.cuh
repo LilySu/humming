@@ -71,7 +71,10 @@ __global__ __launch_bounds__(TuningConfig::kNumThreads, TuningConfig::kNumCtasPe
   using Epilogue = EpiloguePipeline<Ctx, MMA, EpilogueArithmetic>;
   using S2RMemoryPipeline = S2RMemoryPipeline<Ctx, MMA, Epilogue>;
   constexpr uint32_t kAccumulatorRegistersPerThread = sizeof(typename MMA::CRegistersArrayType) / sizeof(uint32_t) * (MMA::final_regs_c_index() + 1);
-  constexpr bool kUseRegisterReallocation = TuningConfig::kNumMathThreads > 128 || ProblemShape::K > BlockShape::K * 16;
+  // R9: a single WGMMA consumer warpgroup (kNumMathThreads==128) still needs role-based
+  // register reallocation to hit the 24/232 producer/consumer split that lets 2 CTAs/SM
+  // reside (1P+1C topology). > -> >= is the only core change.
+  constexpr bool kUseRegisterReallocation = TuningConfig::kNumMathThreads >= 128 || ProblemShape::K > BlockShape::K * 16;
 
   extern __shared__ int4 shared_memory[];
   auto &smem = *reinterpret_cast<SharedStorage *>(shared_memory);
